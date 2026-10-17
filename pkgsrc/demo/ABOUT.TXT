@@ -1,0 +1,4 @@
+DEMO package - the first pck package.
+Install:   pck install demo
+Remove:    pck remove demo
+List all:  pck list

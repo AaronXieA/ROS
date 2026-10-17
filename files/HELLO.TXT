@@ -1,0 +1,5 @@
+Hello from ROS Command!
+
+This file lives on a FAT16 virtual hard disk
+and was printed by the 'doc' command through
+the kernel's own filesystem driver.
