@@ -53,11 +53,15 @@ static void wr32(u8 *p, u32 v)
     p[3] = (u8)(v >> 24);
 }
 
+void fs_shutdown(void)
+{
+    ready = 0;
+}
+
 int fs_init(void)
 {
     u8 mbr[SEC];
     u8 vbr[SEC];
-
     ready = 0;
     if (ata_read(0, 1, mbr) < 0)
         return -1;
@@ -348,6 +352,7 @@ int fs_print_file(const struct fat_dirent *de)
 {
     u32 left = de->size;
     u16 c = de->cluster;
+    char last = 0;
 
     if (!ready || !c)
         return 0;
@@ -357,14 +362,16 @@ int fs_print_file(const struct fat_dirent *de)
             break;
         u32 n = left > fs.cluster_size ? fs.cluster_size : left;
         for (u32 i = 0; i < n; i++) {
-            if (clus_tmp[i] == '\n')
+            char ch = (char)clus_tmp[i];
+            last = ch;
+            if (ch == '\n')
                 con_putc('\r');
-            con_putc((char)clus_tmp[i]);
+            con_putc(ch);
         }
         left -= n;
         c = fat_get(c);
     }
-    return 0;
+    return last == '\n';
 }
 
 /* ---- creation / deletion ---- */

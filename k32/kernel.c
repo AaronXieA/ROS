@@ -13,8 +13,9 @@
 #include "net.h"
 #include "paging.h"
 #include "sched.h"
+#include "update.h"
 
-#define VERSION "0.12.0pre"
+#define VERSION "0.13.0pre"
 #define LINE_MAX 128
 
 #define USER_MAX      16
@@ -42,6 +43,10 @@ extern u32 boot_conv_kb;
 static char cmdline[LINE_MAX];
 static int aliases_on = 1;
 static int fs_ok;
+
+/* shell stdin, set by '<' redirection or a pipe */
+static const char *sh_in;
+static u32 sh_in_len;
 
 static struct user users[USER_MAX];
 static int user_count;
@@ -266,6 +271,11 @@ static const char *const help_lines[] = {
     "  ver     - show version",
     "  clear   - clear screen (alias: cls)",
     "  echo    - print text, e.g. echo hello",
+    "  > >> <  - redirect output/input, e.g. echo hi > A.TXT",
+    "  |       - pipe, e.g. dir | grep TXT",
+    "  grep    - filter input lines, e.g. dir | grep TXT",
+    "  head    - show first lines of input, e.g. head 5",
+    "  wc      - count lines/words/bytes of input",
     "  dir     - list files (alias: ls)",
     "  doc     - show file contents (aliases: cat, type)",
     "  mkdir   - create a directory",
@@ -280,7 +290,8 @@ static const char *const help_lines[] = {
     "  time    - show/set time, e.g. time 12:30:00",
     "  date    - show/set date, e.g. date 2026-10-17",
     "  mem     - show memory information",
-    "  pck     - packages: pck list / install / remove",
+    "  pck     - packages: list / search / install / remove",
+    "  update  - download and flash the latest system image",
     "  net     - show NE2000 network adapter",
     "  ping    - ICMP echo, e.g. ping 10.0.2.2",
     "  run     - run a user program, e.g. run user.bin",
@@ -297,6 +308,14 @@ static void cmd_help(void)
 {
     const int per_page = 20;
     int shown = 0;
+
+    if (con_capture_active()) {      /* redirected or piped: no paging */
+        for (int i = 0; help_lines[i]; i++) {
+            con_puts(help_lines[i]);
+            con_putc('\n');
+        }
+        return;
+    }
 
     con_clear();
     for (int i = 0; help_lines[i]; i++) {
@@ -366,6 +385,13 @@ static void cmd_doc(const char *name)
     struct fat_dirent de;
 
     if (!name) {
+        if (sh_in) {
+            for (u32 i = 0; i < sh_in_len; i++)
+                con_putc(sh_in[i]);
+            if (!sh_in_len || sh_in[sh_in_len - 1] != '\n')
+                con_putc('\n');
+            return;
+        }
         con_puts("Usage: doc <filename>\n");
         return;
     }
@@ -377,14 +403,129 @@ static void cmd_doc(const char *name)
         con_puts("Is a directory.\n");
         return;
     }
-    fs_print_file(&de);
-    con_putc('\n');
+    int ended_nl = fs_print_file(&de);
+    if (de.size && !ended_nl)
+        con_putc('\n');
+}
+
+/* ---- stdin filters (pipes / '<' redirection) ---- */
+static char lower_char(char c)
+{
+    return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+}
+
+static int line_match(const char *line, u32 len, const char *pat)
+{
+    u32 n = strlen(pat);
+
+    if (!n)
+        return 1;
+    if (n > len)
+        return 0;
+    for (u32 i = 0; i + n <= len; i++) {
+        u32 j = 0;
+        while (j < n && lower_char(line[i + j]) == lower_char(pat[j]))
+            j++;
+        if (j == n)
+            return 1;
+    }
+    return 0;
+}
+
+static void cmd_grep(const char *arg)
+{
+    u32 start = 0;
+
+    if (!arg || !*arg) {
+        con_puts("Usage: grep <pattern>\n");
+        return;
+    }
+    if (!sh_in) {
+        con_puts("No input. Use '< file' or a pipe.\n");
+        return;
+    }
+
+    for (u32 i = 0; i <= sh_in_len; i++) {
+        if (i == sh_in_len || sh_in[i] == '\n') {
+            if (line_match(sh_in + start, i - start, arg)) {
+                for (u32 j = start; j < i; j++)
+                    con_putc(sh_in[j]);
+                con_putc('\n');
+            }
+            start = i + 1;
+        }
+    }
+}
+
+static void cmd_head(const char *arg)
+{
+    int n = arg ? atoi(arg) : 10;
+    u32 lines = 0;
+
+    if (n <= 0)
+        n = 10;
+    if (!sh_in) {
+        con_puts("No input. Use '< file' or a pipe.\n");
+        return;
+    }
+
+    for (u32 i = 0; i < sh_in_len; i++) {
+        con_putc(sh_in[i]);
+        if (sh_in[i] == '\n' && ++lines >= (u32)n)
+            return;
+    }
+}
+
+static void cmd_wc(void)
+{
+    u32 lines = 0, words = 0;
+    int inword = 0;
+
+    if (!sh_in) {
+        con_puts("No input. Use '< file' or a pipe.\n");
+        return;
+    }
+
+    for (u32 i = 0; i < sh_in_len; i++) {
+        char c = sh_in[i];
+        if (c == '\n')
+            lines++;
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            inword = 0;
+        } else if (!inword) {
+            inword = 1;
+            words++;
+        }
+    }
+    con_printf("%u %u %u\n", lines, words, sh_in_len);
+}
+
+static int name83_valid(const char *name)
+{
+    int base = 0, ext = 0;
+
+    while (*name && *name != '.') {
+        base++;
+        name++;
+    }
+    if (*name == '.') {
+        name++;
+        while (*name) {
+            ext++;
+            name++;
+        }
+    }
+    return base >= 1 && base <= 8 && ext <= 3;
 }
 
 static void cmd_touch(const char *name)
 {
     if (!name) {
         con_puts("Usage: touch <name>\n");
+        return;
+    }
+    if (!name83_valid(name)) {
+        con_puts("Invalid file name (8.3 format).\n");
         return;
     }
     int rc = fs_create(name, NULL, 0);
@@ -404,6 +545,10 @@ static void cmd_mkdir(const char *name)
 {
     if (!name) {
         con_puts("Usage: mkdir <name>\n");
+        return;
+    }
+    if (!name83_valid(name)) {
+        con_puts("Invalid directory name (8.3 format).\n");
         return;
     }
     int rc = fs_mkdir(name);
@@ -516,7 +661,7 @@ static void cmd_ping(const char *arg)
 static void cmd_pck(const char *arg)
 {
     if (!arg) {
-        con_puts("Usage: pck list | pck install <name> | pck remove <name>\n");
+        con_puts("Usage: pck list | search [kw] | install <name> | remove <name>\n");
         return;
     }
 
@@ -537,6 +682,14 @@ static void cmd_pck(const char *arg)
         pck_list();
         return;
     }
+    if (!strcmp(sub, "search")) {
+        int rc = pck_search(rest);
+        if (rc == -7)
+            con_puts("No NE2000 PCI NIC found.\n");
+        else if (rc == -8)
+            con_puts("Cannot reach the package hub (10.0.2.2:8000).\n");
+        return;
+    }
     if (!strcmp(sub, "install")) {
         if (!rest) {
             con_puts("Usage: pck install <name>\n");
@@ -551,6 +704,12 @@ static void cmd_pck(const char *arg)
             con_puts("Package too large.\n");
         else if (rc == -5)
             con_puts("Invalid package file.\n");
+        else if (rc == -7)
+            con_puts("No NE2000 PCI NIC found.\n");
+        else if (rc == -8)
+            con_puts("Cannot download package from the hub.\n");
+        else if (rc == -9)
+            con_puts("Cannot save downloaded package.\n");
         else
             con_puts("Cannot extract package.\n");
         return;
@@ -571,7 +730,7 @@ static void cmd_pck(const char *arg)
             con_puts("Cannot remove package.\n");
         return;
     }
-    con_puts("Usage: pck list | pck install <name> | pck remove <name>\n");
+    con_puts("Usage: pck list | search [kw] | install <name> | remove <name>\n");
 }
 
 static void cmd_alias(const char *arg)
@@ -800,8 +959,92 @@ static void cmd_vm(void)
     con_printf("User stack VA: 0x%x\n", USER_STACK_VA);
 }
 
-static volatile int crash_zero;
+/* ---- system update ---- */
+static void parse_version(const char *s, int v[3])
+{
+    v[0] = v[1] = v[2] = 0;
+    while (*s && (*s < '0' || *s > '9'))
+        s++;
+    for (int i = 0; i < 3 && *s; i++) {
+        int n = 0;
+        while (*s >= '0' && *s <= '9')
+            n = n * 10 + (*s++ - '0');
+        v[i] = n;
+        if (*s != '.')
+            break;
+        s++;
+    }
+}
 
+static int version_newer(const char *remote, const char *local)
+{
+    int a[3], b[3];
+
+    parse_version(remote, a);
+    parse_version(local, b);
+    for (int i = 0; i < 3; i++) {
+        if (a[i] != b[i])
+            return a[i] > b[i];
+    }
+    return 0;
+}
+
+static void cmd_update(void)
+{
+    char ver[32], ans[8];
+    u32 size = 0;
+    int rc = os_update_info(ver, sizeof(ver), &size);
+
+    if (rc == -1) {
+        con_puts("No NE2000 PCI NIC found.\n");
+        return;
+    }
+    if (rc == -2) {
+        con_puts("Cannot reach the update hub (10.0.2.2:8000).\n");
+        return;
+    }
+    if (rc == -3) {
+        con_puts("Invalid update metadata.\n");
+        return;
+    }
+
+    con_printf("Current version: %s\n", VERSION);
+    con_printf("Latest version:  %s\n", ver);
+    if (!version_newer(ver, VERSION)) {
+        con_puts("Already up to date.\n");
+        return;
+    }
+    if (size)
+        con_printf("Image size: %u KB\n", size / 1024);
+    con_puts("Download and flash the new system? (y/N): ");
+    read_line(ans, sizeof(ans));
+    if (ans[0] != 'y' && ans[0] != 'Y') {
+        con_puts("Cancelled.\n");
+        return;
+    }
+
+    con_puts("Downloading and writing the system image...\n");
+    rc = os_update_apply(size);
+    if (rc == 0) {
+        con_puts("Update complete. Run 'reboot' to start the new system.\n");
+        fs_ok = 0;
+        fs_shutdown();
+    } else if (rc == -2) {
+        con_puts("The hub has no update image.\n");
+    } else if (rc == -3) {
+        con_puts("Download failed; the disk may be incomplete.\n");
+    } else if (rc == -4) {
+        con_puts("Disk write failed; the disk may be incomplete.\n");
+    } else if (rc == -5) {
+        con_puts("The image is not bootable; nothing was written.\n");
+    } else if (rc == -6) {
+        con_puts("Download incomplete or size mismatch.\n");
+    } else {
+        con_puts("Update failed.\n");
+    }
+}
+
+static volatile int crash_zero;
 static void cmd_crash(void)
 {
     int a = 1, b = crash_zero;
@@ -824,7 +1067,7 @@ static void cmd_halt(void)
         cpu_halt();
 }
 
-static void dispatch(char *line)
+static void exec_cmd(char *line)
 {
     while (*line == ' ')
         line++;
@@ -853,6 +1096,12 @@ static void dispatch(char *line)
         if (arg)
             con_puts(arg);
         con_putc('\n');
+    } else if (!strcmp(line, "grep")) {
+        cmd_grep(arg);
+    } else if (!strcmp(line, "head")) {
+        cmd_head(arg);
+    } else if (!strcmp(line, "wc")) {
+        cmd_wc();
     } else if (!strcmp(line, "dir") || (!strcmp(line, "ls") && aliases_on)) {
         cmd_dir();
     } else if (!strcmp(line, "doc") || (!strcmp(line, "cat") && aliases_on) ||
@@ -886,6 +1135,8 @@ static void dispatch(char *line)
         cmd_alias(arg);
     } else if (!strcmp(line, "pck")) {
         cmd_pck(arg);
+    } else if (!strcmp(line, "update")) {
+        cmd_update();
     } else if (!strcmp(line, "net")) {
         net_info();
     } else if (!strcmp(line, "ping")) {
@@ -913,6 +1164,191 @@ static void dispatch(char *line)
     } else {
         con_puts("Unknown command. Type 'help'.\n");
     }
+}
+
+/* ---- shell operators: pipes and redirection ---- */
+#define IO_BUF_SIZE (32 * 1024)
+
+static char io_buf_a[IO_BUF_SIZE];
+static char io_buf_b[IO_BUF_SIZE];
+
+struct seg_io {
+    char cmd[LINE_MAX];
+    char in[20];
+    char out[20];
+    int  has_in;
+    int  has_out;
+    int  append;
+};
+
+/* split a pipeline stage into a plain command plus its redirections */
+static int parse_seg(char *seg, struct seg_io *io)
+{
+    char *d = io->cmd;
+
+    io->has_in = 0;
+    io->has_out = 0;
+    io->append = 0;
+    io->in[0] = 0;
+    io->out[0] = 0;
+
+    for (char *p = seg; *p; ) {
+        if (*p != '<' && *p != '>') {
+            *d++ = *p++;
+            continue;
+        }
+
+        char op = *p++;
+        int append = 0;
+        if (op == '>' && *p == '>') {
+            append = 1;
+            p++;
+        }
+        while (*p == ' ')
+            p++;
+
+        char *name = p;
+        while (*p && *p != ' ' && *p != '<' && *p != '>' && *p != '|')
+            p++;
+        u32 len = (u32)(p - name);
+        if (len == 0 || len >= sizeof(io->out))
+            return -1;
+
+        char *dst = (op == '<') ? io->in : io->out;
+        memcpy(dst, name, len);
+        dst[len] = 0;
+        if (op == '<') {
+            io->has_in = 1;
+        } else {
+            io->has_out = 1;
+            io->append = append;
+        }
+    }
+
+    while (d > io->cmd && d[-1] == ' ')
+        d--;
+    *d = 0;
+    return 0;
+}
+
+static int write_text_file(const char *name, const char *data, u32 len)
+{
+    struct fat_dirent de;
+
+    if (!fs_ok) {
+        con_puts("No filesystem.\n");
+        return -1;
+    }
+    if (!name83_valid(name)) {
+        con_puts("Invalid file name (8.3 format).\n");
+        return -1;
+    }
+    if (fs_find(name, &de) == 0) {
+        if (de.attr & 0x10) {
+            con_puts("Is a directory.\n");
+            return -1;
+        }
+        fs_delete(name);
+    }
+
+    int rc = fs_create(name, (const u8 *)data, len);
+    if (rc < 0) {
+        con_puts(rc == -4 ? "Disk is full.\n" : "Cannot write file.\n");
+        return -1;
+    }
+    return 0;
+}
+
+static void run_line(char *line)
+{
+    char *seg[4];
+    int nseg = 0;
+
+    seg[nseg++] = line;
+    for (char *p = line; *p; p++) {
+        if (*p != '|')
+            continue;
+        *p = 0;
+        if (nseg >= 4) {
+            con_puts("Too many pipes (max 3).\n");
+            return;
+        }
+        seg[nseg++] = p + 1;
+    }
+
+    char *cap = io_buf_a;
+    char *pin = NULL;
+    u32 pin_len = 0;
+
+    for (int i = 0; i < nseg; i++) {
+        struct seg_io io;
+
+        if (parse_seg(seg[i], &io) < 0 || !io.cmd[0]) {
+            con_puts("Syntax error near redirection or pipe.\n");
+            return;
+        }
+
+        if (io.has_in) {
+            struct fat_dirent de;
+            if (!fs_ok || fs_find(io.in, &de) < 0 || (de.attr & 0x10)) {
+                con_puts("File not found.\n");
+                return;
+            }
+            if (de.size > IO_BUF_SIZE) {
+                con_puts("Input file too large (max 32 KB).\n");
+                return;
+            }
+            int got = fs_read_file(&de, (u8 *)cap, IO_BUF_SIZE);
+            pin = cap;
+            pin_len = (u32)got;
+            cap = (cap == io_buf_a) ? io_buf_b : io_buf_a;
+        }
+
+        sh_in = pin;
+        sh_in_len = pin_len;
+
+        int last = (i == nseg - 1);
+        if (last && !io.has_out) {
+            exec_cmd(io.cmd);
+            sh_in = NULL;
+            pin = NULL;
+            pin_len = 0;
+            continue;
+        }
+
+        u32 used = 0;
+        if (io.has_out && io.append) {
+            struct fat_dirent de;
+            if (fs_ok && fs_find(io.out, &de) == 0 && !(de.attr & 0x10)) {
+                if (de.size > IO_BUF_SIZE) {
+                    con_puts("Output file too large to append.\n");
+                    return;
+                }
+                used = (u32)fs_read_file(&de, (u8 *)cap, IO_BUF_SIZE);
+            }
+        }
+
+        int truncated = 0;
+        con_capture_begin(cap, IO_BUF_SIZE, used);
+        exec_cmd(io.cmd);
+        u32 len = con_capture_end(&truncated);
+        sh_in = NULL;
+
+        if (truncated)
+            con_puts("Warning: output truncated at 32 KB.\n");
+
+        if (io.has_out) {
+            if (write_text_file(io.out, cap, len) < 0)
+                return;
+            pin = NULL;
+            pin_len = 0;
+        } else {
+            pin = cap;
+            pin_len = len;
+        }
+        cap = (cap == io_buf_a) ? io_buf_b : io_buf_a;
+    }
+    sh_in = NULL;
 }
 
 /* ---- main ---- */
@@ -951,6 +1387,6 @@ void kmain(void)
         con_puts(fs_cwd());
         con_puts("> ");
         read_line(cmdline, LINE_MAX);
-        dispatch(cmdline);
+        run_line(cmdline);
     }
 }

@@ -10,6 +10,33 @@
 static int row, col;
 static u8 attr = 0x07;
 
+/* output capture */
+static char *cap_buf;
+static u32 cap_max, cap_len;
+static int cap_on, cap_trunc;
+
+void con_capture_begin(char *buf, u32 max, u32 used)
+{
+    cap_buf = buf;
+    cap_max = max;
+    cap_len = used < max ? used : max;
+    cap_on = 1;
+    cap_trunc = 0;
+}
+
+u32 con_capture_end(int *truncated)
+{
+    cap_on = 0;
+    if (truncated)
+        *truncated = cap_trunc;
+    return cap_len;
+}
+
+int con_capture_active(void)
+{
+    return cap_on;
+}
+
 static void cursor_update(void)
 {
     u16 pos = (u16)(row * VGA_W + col);
@@ -39,6 +66,8 @@ void con_init(void)
 
 void con_clear(void)
 {
+    if (cap_on)
+        return;
     for (int i = 0; i < VGA_W * VGA_H; i++)
         VGA_MEM[i] = (u16)(' ' | (attr << 8));
     row = col = 0;
@@ -52,6 +81,21 @@ void con_set_color(u8 color)
 
 void con_putc(char c)
 {
+    if (cap_on) {
+        if (c == '\r')
+            return;
+        if (c == '\b') {
+            if (cap_len)
+                cap_len--;
+            return;
+        }
+        if (cap_len < cap_max)
+            cap_buf[cap_len++] = c;
+        else
+            cap_trunc = 1;
+        return;
+    }
+
     if (c == '\n') {
         col = 0;
         row++;
@@ -69,6 +113,8 @@ void con_putc(char c)
         } else if (row > 0) {
             row--;
             col = VGA_W - 1;
+        } else {
+            return;             /* already at the top-left corner */
         }
         VGA_MEM[row * VGA_W + col] = (u16)(' ' | (attr << 8));
     } else {
@@ -171,6 +217,7 @@ void con_printf(const char *fmt, ...)
 
 void con_fatal_banner(void)
 {
+    cap_on = 0;                 /* a fatal error always goes to the screen */
     for (int i = 0; i < VGA_W; i++)
         VGA_MEM[i] = (u16)(' ' | (0x4F << 8));
     const char *s = "FATAL EXCEPTION";

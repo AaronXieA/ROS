@@ -40,14 +40,36 @@ static u32 gw_ip = 0x0A000202;  /* 10.0.2.2 */
 
 static u8 arp_mac[6];
 static u32 arp_ip;
+static u32 arp_want;
 static int arp_ok;
 
-static u32 ping_ip;
 static int ping_got;
 static u8 ping_ttl;
 
 static u8 rxbuf[1600];
-static u8 txbuf[128];
+static u8 txbuf[1600];
+
+/* ---- TCP client state ---- */
+#define TCP_FIN 0x01
+#define TCP_SYN 0x02
+#define TCP_RST 0x04
+#define TCP_PSH 0x08
+#define TCP_ACK 0x10
+
+#define TCP_RXBUF_SIZE (72 * 1024)
+#define TCP_WINDOW     8192
+
+static u32 tcp_remote_ip;
+static u16 tcp_remote_port;
+static u16 tcp_local_port;
+static u32 tcp_snd_nxt;
+static u32 tcp_rcv_nxt;
+static u8  tcp_peer_mac[6];
+static int tcp_state;           /* 0 closed, 1 SYN sent, 2 established */
+static int tcp_got_reset;
+static int tcp_got_fin;
+static u32 tcp_rx_len;
+static u8  tcp_rxbuf[TCP_RXBUF_SIZE];
 
 /* ---- PCI config space ---- */
 static u32 pci_read(u32 addr)
@@ -297,11 +319,24 @@ static int ne_send(const u8 *frame, u16 len)
     return 0;
 }
 
+/* true when the receive ring holds unread frames (BNRY+1 != CURR) */
+static int ne_has_frame(void)
+{
+    u8 bnry = ne_in(NE_BNRY);
+
+    ne_out(NE_CMD, 0x62);       /* start, page 1 */
+    u8 curr = ne_in(NE_CURR);
+    ne_out(NE_CMD, 0x22);       /* start, page 0 */
+    return (u8)(bnry + 1) != curr;
+}
+
 /* copy one frame from the ring; returns 1 if a frame was copied */
 static int ne_poll(u16 *out_len)
 {
-    if (!(ne_in(NE_ISR) & 0x01))
+    if (!ne_has_frame()) {
+        ne_out(NE_ISR, 0x01);
         return 0;
+    }
     ne_out(NE_ISR, 0x01);
 
     u8 page = (u8)(ne_in(NE_BNRY) + 1);
@@ -364,6 +399,98 @@ static void ip_bytes(u32 ip, u8 *out)
     out[1] = (u8)(ip >> 16);
     out[2] = (u8)(ip >> 8);
     out[3] = (u8)ip;
+}
+
+static u16 rd16be(const u8 *p)
+{
+    return (u16)((p[0] << 8) | p[1]);
+}
+
+static u32 rd32be(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+}
+
+static void wr16be(u8 *p, u16 v)
+{
+    p[0] = (u8)(v >> 8);
+    p[1] = (u8)v;
+}
+
+static void wr32be(u8 *p, u32 v)
+{
+    p[0] = (u8)(v >> 24);
+    p[1] = (u8)(v >> 16);
+    p[2] = (u8)(v >> 8);
+    p[3] = (u8)v;
+}
+
+static u16 tcp_csum(u32 src, u32 dst, const u8 *seg, u16 len)
+{
+    u32 sum = 0;
+    u16 left = len;
+
+    sum += (src >> 16) & 0xFFFF;
+    sum += src & 0xFFFF;
+    sum += (dst >> 16) & 0xFFFF;
+    sum += dst & 0xFFFF;
+    sum += 6;                   /* protocol TCP */
+    sum += len;
+
+    while (left > 1) {
+        sum += (u32)((seg[0] << 8) | seg[1]);
+        seg += 2;
+        left -= 2;
+    }
+    if (left)
+        sum += (u32)(seg[0] << 8);
+
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return (u16)(~sum & 0xFFFF);
+}
+
+/* build and transmit one TCP segment (no options, 20-byte header) */
+static int tcp_send(u8 flags, const u8 *data, u16 len)
+{
+    u16 tcp_len = (u16)(20 + len);
+    u16 total = (u16)(20 + tcp_len);
+
+    memset(txbuf, 0, (size_t)(14 + total));
+    memcpy(txbuf, tcp_peer_mac, 6);
+    memcpy(txbuf + 6, mac, 6);
+    txbuf[12] = 0x08;
+    txbuf[13] = 0x00;
+
+    u8 *ip = txbuf + 14;
+    ip[0] = 0x45;
+    ip[2] = (u8)(total >> 8);
+    ip[3] = (u8)total;
+    ip[6] = 0x40;               /* don't fragment */
+    ip[8] = 64;                 /* TTL */
+    ip[9] = 6;                  /* TCP */
+    ip_bytes(my_ip, ip + 12);
+    ip_bytes(tcp_remote_ip, ip + 16);
+    u16 c = csum16(ip, 20);
+    ip[10] = (u8)(c >> 8);
+    ip[11] = (u8)c;
+
+    u8 *t = ip + 20;
+    wr16be(t + 0, tcp_local_port);
+    wr16be(t + 2, tcp_remote_port);
+    wr32be(t + 4, tcp_snd_nxt);
+    wr32be(t + 8, tcp_rcv_nxt);
+    t[12] = 5 << 4;             /* data offset */
+    t[13] = flags;
+    wr16be(t + 14, TCP_WINDOW);
+    if (len)
+        memcpy(t + 20, data, len);
+
+    u16 tc = tcp_csum(my_ip, tcp_remote_ip, t, tcp_len);
+    t[16] = (u8)(tc >> 8);
+    t[17] = (u8)tc;
+
+    return ne_send(txbuf, (u16)(14 + total));
 }
 
 static void build_arp_request(u32 target, u16 *len)
@@ -437,6 +564,8 @@ static void build_icmp(u32 dst, u16 seq, u16 *len)
     *len = 74;
 }
 
+static void tcp_input(const u8 *ip, u16 ip_len);
+
 /* ---- incoming frames ---- */
 static void handle_frame(u16 len)
 {
@@ -458,7 +587,7 @@ static void handle_frame(u16 len)
         } else if (oper == 2) {
             u32 spa = ((u32)rxbuf[28] << 24) | ((u32)rxbuf[29] << 16) |
                       ((u32)rxbuf[30] << 8) | rxbuf[31];
-            if (spa == ping_ip) {
+            if (spa == arp_want) {
                 memcpy(arp_mac, rxbuf + 22, 6);
                 arp_ip = spa;
                 arp_ok = 1;
@@ -469,21 +598,31 @@ static void handle_frame(u16 len)
 
     if (rxbuf[12] != 0x08 || rxbuf[13] != 0x00)
         return;
-    if (len < 42)
-        return;
-    if (rxbuf[23] != 1)                 /* ICMP */
+    if (len < 34)
         return;
 
-    u32 dst = ((u32)rxbuf[30] << 24) | ((u32)rxbuf[31] << 16) |
-              ((u32)rxbuf[32] << 8) | rxbuf[33];
+    const u8 *ip = rxbuf + 14;
+    u16 ip_len = (u16)(((u16)ip[2] << 8) | ip[3]);
+    if (ip_len > (u16)(len - 14))
+        ip_len = (u16)(len - 14);
+
+    if (ip[9] == 6) {                   /* TCP */
+        tcp_input(ip, ip_len);
+        return;
+    }
+    if (ip[9] != 1 || ip_len < 28)      /* ICMP */
+        return;
+
+    u32 dst = ((u32)ip[16] << 24) | ((u32)ip[17] << 16) |
+              ((u32)ip[18] << 8) | ip[19];
     if (dst != my_ip)
         return;
-    if (rxbuf[34] != 0)                 /* echo reply */
+    if (ip[20] != 0)                    /* echo reply */
         return;
-    if (rxbuf[38] != 0x52 || rxbuf[39] != 0x53)
+    if (ip[24] != 0x52 || ip[25] != 0x53)
         return;
 
-    ping_ttl = rxbuf[22];
+    ping_ttl = ip[8];
     ping_got = 1;
 }
 
@@ -500,6 +639,349 @@ static void pump_ms(u32 ms)
     }
 }
 
+static int pump_once(void)
+{
+    int got = 0;
+    u16 len;
+
+    /* stop while there is still room to store the next burst */
+    while (tcp_rx_len + 4096 < TCP_RXBUF_SIZE && ne_poll(&len)) {
+        handle_frame(len);
+        got = 1;
+    }
+    return got;
+}
+
+/* ---- ARP / TCP / HTTP ---- */
+static int arp_resolve(u32 ip)
+{
+    arp_want = ip;
+    arp_ok = 0;
+
+    for (int attempt = 0; attempt < 3 && !arp_ok; attempt++) {
+        u16 len;
+        build_arp_request(ip, &len);
+        ne_send(txbuf, len);
+        for (int slice = 0; slice < 10 && !arp_ok; slice++)
+            pump_ms(100);
+    }
+    return arp_ok ? 0 : -1;
+}
+
+static void tcp_input(const u8 *ip, u16 ip_len)
+{
+    if (tcp_state == 0)
+        return;
+
+    u32 src = rd32be(ip + 12);
+    u32 dst = rd32be(ip + 16);
+    if (src != tcp_remote_ip || dst != my_ip)
+        return;
+
+    u16 ihl = (u16)((ip[0] & 0x0F) * 4);
+    if (ip_len < ihl + 20)
+        return;
+
+    const u8 *t = ip + ihl;
+    u16 sport = rd16be(t + 0);
+    u16 dport = rd16be(t + 2);
+    if (sport != tcp_remote_port || dport != tcp_local_port)
+        return;
+
+    u32 seq = rd32be(t + 4);
+    u32 ack = rd32be(t + 8);
+    u8 flags = t[13];
+    u16 doff = (u16)((t[12] >> 4) * 4);
+    if (doff < 20 || ip_len < ihl + doff)
+        return;
+    u16 seg_len = (u16)(ip_len - ihl - doff);
+    const u8 *data = t + doff;
+
+    if (flags & TCP_RST) {
+        tcp_got_reset = 1;
+        tcp_state = 0;
+        return;
+    }
+
+    if (flags & TCP_SYN) {
+        if (tcp_state == 1 && (flags & TCP_ACK) && ack == tcp_snd_nxt + 1) {
+            tcp_snd_nxt = ack;
+            tcp_rcv_nxt = seq + 1;
+            tcp_state = 2;
+            tcp_send(TCP_ACK, NULL, 0);
+        }
+        return;
+    }
+
+    if (tcp_state != 2)
+        return;
+
+    if (seg_len) {
+        if (seq == tcp_rcv_nxt) {
+            if (TCP_RXBUF_SIZE - tcp_rx_len < seg_len)
+                return;                 /* no room: drop, the sender retries */
+            memcpy(tcp_rxbuf + tcp_rx_len, data, seg_len);
+            tcp_rx_len += seg_len;
+            tcp_rcv_nxt += seg_len;
+            tcp_send(TCP_ACK, NULL, 0);
+        } else if ((s32)(seq - tcp_rcv_nxt) < 0) {
+            tcp_send(TCP_ACK, NULL, 0);     /* retransmit: re-ACK */
+        }
+    }
+
+    if (flags & TCP_FIN) {
+        if (seq + seg_len == tcp_rcv_nxt) {
+            tcp_rcv_nxt++;
+            tcp_got_fin = 1;
+            tcp_send(TCP_ACK, NULL, 0);
+        }
+    }
+    (void)ack;
+}
+
+static int tcp_connect(void)
+{
+    if (tcp_send(TCP_SYN, NULL, 0) < 0) {
+        tcp_state = 0;
+        return -1;
+    }
+
+    u32 start = timer_ticks();
+    while (tcp_state == 1 && timer_ticks() - start < 300)
+        pump_ms(5);
+
+    return tcp_state == 2 ? 0 : -1;
+}
+
+static int find_header_end(u32 *end)
+{
+    for (u32 i = 0; i + 3 < tcp_rx_len; i++) {
+        if (tcp_rxbuf[i] == '\r' && tcp_rxbuf[i + 1] == '\n' &&
+            tcp_rxbuf[i + 2] == '\r' && tcp_rxbuf[i + 3] == '\n') {
+            *end = i + 4;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int ci_match(const u8 *p, const char *s)
+{
+    while (*s) {
+        char a = (char)*p++;
+        char b = *s++;
+        if (a >= 'A' && a <= 'Z')
+            a = (char)(a + 32);
+        if (a != b)
+            return 0;
+    }
+    return 1;
+}
+
+static int http_status(void)
+{
+    if (tcp_rx_len < 12 || !ci_match(tcp_rxbuf, "http/"))
+        return -1;
+
+    u32 i = 0;
+    while (i < tcp_rx_len && tcp_rxbuf[i] != ' ')
+        i++;
+    i++;
+    if (i + 2 >= tcp_rx_len)
+        return -1;
+    if (tcp_rxbuf[i] < '0' || tcp_rxbuf[i] > '9')
+        return -1;
+    return (tcp_rxbuf[i] - '0') * 100 + (tcp_rxbuf[i + 1] - '0') * 10 +
+           (tcp_rxbuf[i + 2] - '0');
+}
+
+/* 0xFFFFFFFF when the header is absent */
+static u32 http_content_length(u32 end)
+{
+    u32 i = 0;
+
+    while (i < end) {
+        u32 line = i;
+        while (i < end && tcp_rxbuf[i] != '\n')
+            i++;
+        u32 e = i;
+        if (e > line && tcp_rxbuf[e - 1] == '\r')
+            e--;
+        if (e > line && ci_match(tcp_rxbuf + line, "content-length:")) {
+            u32 p = line + 15;
+            u32 v = 0;
+            while (p < e && tcp_rxbuf[p] == ' ')
+                p++;
+            while (p < e && tcp_rxbuf[p] >= '0' && tcp_rxbuf[p] <= '9')
+                v = v * 10 + (u32)(tcp_rxbuf[p++] - '0');
+            return v;
+        }
+        i++;
+    }
+    return 0xFFFFFFFFu;
+}
+
+static void str_add(char *b, int *n, const char *s)
+{
+    while (*s)
+        b[(*n)++] = *s++;
+}
+
+int net_http_get_stream(u32 ip, u16 port, const char *path,
+                        net_sink_fn sink, void *ctx, u32 *out_len)
+{
+    char ipstr[20], portstr[12];
+    char req[320];
+    int n = 0;
+
+    if (!ready)
+        return -1;
+
+    u32 hop = ((ip ^ my_ip) & 0xFFFFFF00u) ? gw_ip : ip;
+    if (arp_resolve(hop) < 0)
+        return -1;
+
+    tcp_remote_ip = ip;
+    tcp_remote_port = port;
+    memcpy(tcp_peer_mac, arp_mac, 6);
+    tcp_local_port = (u16)(40000 + (timer_ticks() & 0x3FFF));
+    tcp_snd_nxt = (timer_ticks() * 0x9E3779B1u) ^ 0x5A5A1234u;
+    tcp_rcv_nxt = 0;
+    tcp_rx_len = 0;
+    tcp_got_reset = 0;
+    tcp_got_fin = 0;
+    tcp_state = 1;
+
+    if (tcp_connect() < 0)
+        return -3;
+
+    net_ip_str(ip, ipstr);
+    utoa(port, portstr);
+    str_add(req, &n, "GET ");
+    str_add(req, &n, path);
+    str_add(req, &n, " HTTP/1.1\r\nHost: ");
+    str_add(req, &n, ipstr);
+    str_add(req, &n, ":");
+    str_add(req, &n, portstr);
+    str_add(req, &n, "\r\nConnection: close\r\nUser-Agent: ros-update\r\n\r\n");
+
+    if (tcp_send(TCP_PSH | TCP_ACK, (const u8 *)req, (u16)n) < 0) {
+        tcp_state = 0;
+        return -3;
+    }
+    tcp_snd_nxt += (u32)n;
+
+    int hdr = -1;
+    u32 body = 0, clen = 0, total = 0;
+    int have_cl = 0, rc = -4;
+    u32 last = timer_ticks();
+
+    for (;;) {
+        if (tcp_got_reset) {
+            rc = -4;
+            break;
+        }
+
+        if (hdr < 0) {
+            u32 end;
+            if (find_header_end(&end) == 0) {
+                if (http_status() != 200) {
+                    rc = -2;
+                    break;
+                }
+                hdr = (int)end;
+                body = end;
+                clen = http_content_length(end);
+                have_cl = (clen != 0xFFFFFFFFu);
+                if (have_cl && clen == 0) {
+                    rc = 0;
+                    break;
+                }
+            }
+        }
+
+        if (hdr >= 0 && body < tcp_rx_len) {
+            u32 chunk = tcp_rx_len - body;
+            if (sink(ctx, tcp_rxbuf + body, chunk) < 0) {
+                rc = -6;
+                break;
+            }
+            total += chunk;
+            tcp_rx_len = 0;         /* header is no longer needed */
+            body = 0;
+            last = timer_ticks();
+            if (have_cl && total >= clen) {
+                rc = (total == clen) ? 0 : -6;
+                break;
+            }
+        }
+
+        if (tcp_got_fin) {
+            rc = (hdr >= 0 && !have_cl) ? 0 : -4;
+            break;
+        }
+        if (timer_ticks() - last > 2000) {      /* 20 s without progress */
+            rc = -4;
+            break;
+        }
+        if (pump_once())
+            last = timer_ticks();
+    }
+
+    if (rc == 0 && have_cl && total != clen)
+        rc = -6;
+    if (out_len)
+        *out_len = total;
+
+    if (tcp_state == 2) {
+        tcp_send(TCP_FIN | TCP_ACK, NULL, 0);
+        tcp_snd_nxt++;
+    }
+    tcp_state = 0;
+    return rc;
+}
+
+struct mem_sink {
+    u8 *out;
+    u32 max;
+    u32 len;
+    int over;
+};
+
+static int mem_sink_fn(void *ctx, const u8 *data, u32 len)
+{
+    struct mem_sink *m = ctx;
+
+    if (m->len + len > m->max) {
+        m->over = 1;
+        return -1;
+    }
+    if (len)
+        memcpy(m->out + m->len, data, len);
+    m->len += len;
+    return 0;
+}
+
+int net_http_get(u32 ip, u16 port, const char *path, u8 *out, u32 max,
+                 u32 *out_len)
+{
+    struct mem_sink m;
+    u32 total = 0;
+    int rc;
+
+    m.out = out;
+    m.max = max;
+    m.len = 0;
+    m.over = 0;
+
+    rc = net_http_get_stream(ip, port, path, mem_sink_fn, &m, &total);
+    if (out_len)
+        *out_len = m.len;
+    if (rc == -6 && m.over)
+        return -5;
+    return rc;
+}
+
 /* ---- commands ---- */
 int net_ping(u32 ip)
 {
@@ -509,7 +991,6 @@ int net_ping(u32 ip)
     if (!ready)
         return -1;
 
-    ping_ip = ip;
     arp_ok = 0;
 
     net_ip_str(ip, ipstr);
@@ -518,14 +999,7 @@ int net_ping(u32 ip)
     for (int seq = 0; seq < 4; seq++) {
         /* resolve */
         if (!arp_ok) {
-            for (int attempt = 0; attempt < 3 && !arp_ok; attempt++) {
-                u16 len;
-                build_arp_request(ip, &len);
-                ne_send(txbuf, len);
-                for (int slice = 0; slice < 10 && !arp_ok; slice++)
-                    pump_ms(100);
-            }
-            if (!arp_ok) {
+            if (arp_resolve(ip) < 0) {
                 con_puts("ARP failed: destination host unreachable.\n");
                 return -2;
             }

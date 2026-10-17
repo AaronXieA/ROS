@@ -2,10 +2,13 @@
 #include "fat.h"
 #include "console.h"
 #include "string.h"
+#include "net.h"
+#include "hub.h"
 
 #define PKG_MAX (64 * 1024)
 
 static u8 pkg_buf[PKG_MAX];
+static u8 dl_buf[PKG_MAX];
 
 static u16 rd16(const u8 *p)
 {
@@ -115,10 +118,46 @@ static int load_pkg(const char *name, u32 *size_out)
     return 0;
 }
 
+static int download_pkg(const char *name)
+{
+    struct fat_dirent dir;
+    char fname[16], path[24];
+    u32 size = 0;
+    int n = 1;
+
+    if (!net_ready())
+        return -7;
+
+    pkg_file_name(name, fname);
+    path[0] = '/';
+    for (int i = 0; fname[i] && n < 20; i++)
+        path[n++] = fname[i];
+    path[n] = 0;
+
+    if (net_http_get(HUB_IP, HUB_PORT, path, dl_buf, PKG_MAX, &size) < 0)
+        return -8;
+    if (size < 6 || memcmp(dl_buf, "PCK1", 4) != 0)
+        return -5;
+    if (find_pck_dir(&dir) < 0)
+        return -9;
+
+    fs_delete_at(dir.cluster, fname);
+    if (fs_create_at(dir.cluster, fname, dl_buf, size) != 0)
+        return -9;
+    return 0;
+}
+
 int pck_install(const char *name)
 {
     u32 size;
     int rc = load_pkg(name, &size);
+
+    if (rc == -1) {                 /* not cached locally: fetch from the hub */
+        rc = download_pkg(name);
+        if (rc < 0)
+            return rc;
+        rc = load_pkg(name, &size);
+    }
     if (rc == -2)
         return -4;
     if (rc == -3)
@@ -145,6 +184,64 @@ int pck_install(const char *name)
             return -6;
         off += len;
     }
+    return 0;
+}
+
+static char pck_lower(char c)
+{
+    return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+}
+
+static int pck_contains(const char *hay, u32 len, const char *needle)
+{
+    u32 n = strlen(needle);
+
+    if (!n)
+        return 1;
+    if (n > len)
+        return 0;
+    for (u32 i = 0; i + n <= len; i++) {
+        u32 j = 0;
+        while (j < n && pck_lower(hay[i + j]) == pck_lower(needle[j]))
+            j++;
+        if (j == n)
+            return 1;
+    }
+    return 0;
+}
+
+int pck_search(const char *keyword)
+{
+    static char idx[4096];
+    u32 n = 0, i = 0;
+    int hits = 0;
+
+    if (!net_ready())
+        return -7;
+    if (net_http_get(HUB_IP, HUB_PORT, "/index.txt", (u8 *)idx,
+                     sizeof(idx) - 1, &n) < 0)
+        return -8;
+
+    while (i < n) {
+        u32 start = i;
+        while (i < n && idx[i] != '\n')
+            i++;
+        u32 end = i;
+        if (i < n)
+            i++;
+        if (end > start && idx[end - 1] == '\r')
+            end--;
+
+        if (end > start &&
+            (!keyword || pck_contains(idx + start, end - start, keyword))) {
+            for (u32 j = start; j < end; j++)
+                con_putc(idx[j]);
+            con_putc('\n');
+            hits++;
+        }
+    }
+
+    con_printf("%d package(s)\n", hits);
     return 0;
 }
 

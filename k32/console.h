@@ -12,4 +12,9 @@ void con_printf(const char *fmt, ...);
 void con_set_color(u8 color);
 void con_fatal_banner(void);
 
+/* output capture, used by shell redirection and pipes */
+void con_capture_begin(char *buf, u32 max, u32 used);
+u32  con_capture_end(int *truncated);
+int  con_capture_active(void);
+
 #endif

@@ -5,6 +5,7 @@
 #include "types.h"
 
 void pck_list(void);
+int  pck_search(const char *keyword);
 int  pck_install(const char *name);
 int  pck_remove(const char *name);
 

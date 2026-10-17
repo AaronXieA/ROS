@@ -12,6 +12,7 @@ struct fat_dirent {
 };
 
 int  fs_init(void);
+void fs_shutdown(void);
 int  fs_list(int (*cb)(const struct fat_dirent *, void *), void *ctx);
 int  fs_list_at(u16 dir, int (*cb)(const struct fat_dirent *, void *), void *ctx);
 int  fs_find(const char *name, struct fat_dirent *out);

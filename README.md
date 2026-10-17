@@ -18,8 +18,14 @@ By **XR Stu** — <https://xrst.uk>
 - ATA PIO disk driver, PS/2 keyboard, PIT timer, VGA text console
 - RTC time/date (read and set), E820 memory report, CPU exception screen
 - **NE2000 (RTL8029) network driver**: PCI PIO, ARP + IPv4/ICMP, `ping 10.0.2.2`
+- **TCP + HTTP/1.1 client**: `pck search` / `pck install` download packages from
+  GitHub Releases through a small host-side hub (`tools/pckhub.py`)
+- **System update**: `update` downloads the newest release image and flashes it
+  onto the disk in place, then asks you to reboot
 - xsh shell: `help`, `dir`, `doc`, `mkdir`, `touch`, `goto`, `echo`, `time`, `date`,
   `mem`, `net`, `ping`, `pck`, `alias`, `run`, `ps`, `kill`, `vm` and more
+- **Shell operators**: output redirection `>` / `>>`, input redirection `<`,
+  and pipes `|` (up to 4 stages); built-in filters `grep`, `head`, `wc`
 - **Multi-user accounts**: `cru <user>` to create, `cu <user>` to switch,
   `passwd <user>` to set a password (stored hashed in `/USER.DAT`)
 - Command aliases: `cls`, `ls`, `cat`, `type`, `cd`, `pwd`, `whoami`
@@ -62,13 +68,59 @@ by `ld.lld`, and flattened with `llvm-objcopy`.
 | `user/user.asm` | demo ring-3 program loaded as `/USER.BIN` |
 | `legacy/kernel16.asm` | previous 16-bit assembly kernel (reference) |
 
+## Shell operators
+
+```sh
+echo hello > A.TXT       # write output to a file (overwrite)
+echo world >> A.TXT      # append output to a file
+doc < A.TXT              # feed a file to a command's stdin
+dir | grep txt           # pipe output into another command
+dir | grep txt | wc      # chain up to 4 stages
+doc A.TXT | head 1
+```
+
+`grep`, `head` and `wc` read from stdin when used in a pipe or with `<`.
+Pipes and redirection use two 32 KB kernel buffers, so a single stream is
+limited to 32 KB.
+
 ## Packages
 
 `.pck` packages are published as release assets:
 
 <https://github.com/AaronXieA/ROS/releases/tag/pck-packages>
 
-Put a package in the `/PCK` directory of the disk image, then `pck install <name>`.
+```sh
+pck search            # list every package in the release
+pck search demo       # filter by keyword
+pck install demo      # use /PCK/DEMO.PCK, or download it from the release
+pck remove demo       # delete the files that the package installed
+```
+
+`run.sh` starts `tools/pckhub.py` on the host (guest address `10.0.2.2:8000`).
+The hub fetches the release asset list from the GitHub API and downloads
+`.PCK` files on demand into `build/pckcache`, serving them to the kernel over
+plain HTTP. GitHub itself only speaks HTTPS and the kernel has no TLS stack,
+which is why this small bridge exists. Start QEMU with `PCKHUB=0 ./run.sh` to
+skip the hub, or put a `.PCK` in the `/PCK` directory yourself.
+
+## System update
+
+```sh
+update
+```
+
+The command asks the hub for the newest release that ships a `ros-*.img.gz`
+(or `.img`) asset, compares its version with the running one and, if it is
+newer, downloads the raw 32 MB image and writes it straight onto the disk
+(the image is decompressed by the hub). The MBR signature is checked before
+the first write, the final size must match, and `reboot` is required
+afterwards.
+
+For a local test without publishing a release, point the hub at an image:
+
+```sh
+ROS_IMAGE=build/ros.img ROS_VERSION=0.13.1-test ./run.sh
+```
 
 ## Versioning
 
