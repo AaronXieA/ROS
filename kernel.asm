@@ -15,7 +15,7 @@
 %define FILE_SEG    0x3000    ; file load buffer (doc)
 %define BUF_SIZE    128
 %define PATH_SIZE   96
-%define VERSION     "0.8.0"
+%define VERSION     "0.8.1"
 %define MAX_FAT_SEC 64        ; fat_buf holds up to 64 sectors (32KB)
 
 ; GDT selectors (descriptors are flat with base 0x10000,
@@ -38,6 +38,7 @@ start:
 
     call init_fs                ; parse BPB + load FAT into fat_buf
     call detect_ram             ; E820 memory map + prepare GDT pointer
+    call install_exceptions     ; hook CPU exception vectors
 
     call clear_screen
     mov si, banner
@@ -573,6 +574,255 @@ cmd_halt:
 .loop:
     hlt
     jmp .loop
+
+; --------------------------------------------
+; Fatal exception framework
+; --------------------------------------------
+install_exceptions:
+    push es
+    push di
+    xor ax, ax
+    mov es, ax
+; NOTE: vectors 8/12/13 are IRQ0/IRQ4/IRQ5 in real mode, so
+; #DF/#SS/#GP cannot be hooked while BIOS IRQs stay enabled.
+%macro SETVEC 2
+    mov di, (%1)*4
+    mov word [es:di], %2
+    mov word [es:di+2], KERNEL_SEG
+%endmacro
+    SETVEC 0,  exc0             ; divide error
+    SETVEC 6,  exc6             ; invalid opcode
+    pop di
+    pop es
+    ret
+
+; IVT stubs. Every vector arrives at exc_common with the same
+; stack layout: vec, errcode(=0), IP, CS, FLAGS.
+exc0:
+    push word 0                 ; no CPU error code
+    push word 0
+    jmp exc_common
+exc6:
+    push word 0
+    push word 6
+    jmp exc_common
+
+exc_common:
+    cli
+    cld
+    push ax
+    mov ax, ds
+    push ax
+    mov ax, es
+    push ax
+    mov ax, cs
+    mov ds, ax
+    mov es, ax
+    pop ax
+    mov [r_es], ax
+    pop ax
+    mov [r_ds], ax
+    pop ax
+    mov [r_ax], ax
+    mov bp, sp                  ; bp -> vec (+2 code +4 IP +6 CS +8 FLAGS)
+    mov ax, [bp]
+    mov [r_vec], ax
+    mov ax, [bp+2]
+    mov [r_code], ax
+    mov ax, [bp+4]
+    mov [r_ip], ax
+    mov ax, [bp+6]
+    mov [r_cs], ax
+    mov ax, [bp+8]
+    mov [r_flags], ax
+    mov [r_bx], bx
+    mov [r_cx], cx
+    mov [r_dx], dx
+    mov [r_si], si
+    mov [r_di], di
+    mov [r_bp], bp
+    mov ax, ss
+    mov [r_ss], ax
+    mov ax, bp
+    add ax, 10                  ; strip vec/code/IP/CS/FLAGS
+    mov [r_sp], ax
+
+    ; pick a human-readable reason
+    mov ax, [r_vec]
+    mov si, txt_exc_unknown
+    cmp ax, 0
+    jne .n6
+    mov si, txt_exc_de
+    jmp .show
+.n6:
+    cmp ax, 6
+    jne .show
+    mov si, txt_exc_ud
+.show:
+    call panic
+
+    ; register dump
+    mov si, txt_dump_code
+    call print
+    mov ax, [r_code]
+    call print_hex16
+    mov si, newline
+    call print
+
+    mov si, txt_dump_csip
+    call print
+    mov ax, [r_cs]
+    call print_hex16
+    mov al, ':'
+    call print_char
+    mov ax, [r_ip]
+    call print_hex16
+    mov si, newline
+    call print
+
+    mov si, txt_dump_sssp
+    call print
+    mov ax, [r_ss]
+    call print_hex16
+    mov al, ':'
+    call print_char
+    mov ax, [r_sp]
+    call print_hex16
+    mov si, txt_dump_flags
+    call print
+    mov ax, [r_flags]
+    call print_hex16
+    mov si, newline
+    call print
+
+    mov si, txt_dump_gpr1
+    call print
+    mov ax, [r_ax]
+    call print_hex16
+    mov si, txt_lbl_bx
+    call print
+    mov ax, [r_bx]
+    call print_hex16
+    mov si, txt_lbl_cx
+    call print
+    mov ax, [r_cx]
+    call print_hex16
+    mov si, txt_lbl_dx
+    call print
+    mov ax, [r_dx]
+    call print_hex16
+    mov si, newline
+    call print
+
+    mov si, txt_lbl_si
+    call print
+    mov ax, [r_si]
+    call print_hex16
+    mov si, txt_lbl_di
+    call print
+    mov ax, [r_di]
+    call print_hex16
+    mov si, txt_lbl_bp
+    call print
+    mov ax, [r_bp]
+    call print_hex16
+    mov si, newline
+    call print
+
+    mov si, txt_lbl_ds
+    call print
+    mov ax, [r_ds]
+    call print_hex16
+    mov si, txt_lbl_es
+    call print
+    mov ax, [r_es]
+    call print_hex16
+    mov si, newline
+    call print
+
+    mov si, txt_exc_unknown_vec
+    call print
+    mov ax, [r_vec]
+    call print_hex16
+    mov si, newline
+    call print
+
+    mov si, txt_panic_halt
+    call print
+.halt:
+    cli
+    hlt
+    jmp .halt
+
+; panic: red FATAL EXCEPTION banner + reason.
+; SI (DS) -> reason string. Prints the screen and returns; the
+; caller must halt (exception path dumps registers first).
+panic:
+    cli
+    mov [reason_ptr], si
+    push es
+    pusha
+    ; paint a white-on-red bar across the top row
+    mov ax, 0xB800
+    mov es, ax
+    xor di, di
+    mov cx, 80
+    mov ax, 0x4F20              ; space, white on red
+    rep stosw
+    ; center "FATAL EXCEPTION" (15 chars) at column 32
+    mov di, 32*2
+    mov si, txt_fatal_bar
+.bar:
+    lodsb
+    test al, al
+    jz .bar_done
+    mov ah, 0x4F
+    stosw
+    jmp .bar
+.bar_done:
+    ; move cursor to row 2
+    mov ah, 0x02
+    xor bx, bx
+    mov dx, 0x0200
+    int 0x10
+    popa
+    pop es
+    mov si, txt_panic_intro
+    call print
+    mov si, [reason_ptr]
+    call print
+    mov si, newline
+    call print
+    ret
+
+; print_hex16: AX -> 4 hex digits. print_hex8: AL -> 2 digits.
+; NOTE: print_char clobbers BX, so values are kept on the stack.
+print_hex16:
+    push ax
+    mov al, ah
+    call print_hex8
+    pop ax
+    call print_hex8
+    ret
+
+print_hex8:
+    push ax
+    shr al, 4
+    call print_nibble
+    pop ax
+    and al, 0x0F
+    call print_nibble
+    ret
+
+print_nibble:
+    and al, 0x0F
+    add al, '0'
+    cmp al, '9'
+    jbe .ok
+    add al, 7
+.ok:
+    call print_char
+    ret
 
 ; --------------------------------------------
 ; pm: enter 32-bit protected mode, run a
@@ -1840,10 +2090,12 @@ read_lba:
     popa
     ret
 .err:
-    mov si, msg_diskerr
-    call print
-    popa
-    ret
+    mov si, txt_io_disk
+    call panic                  ; fatal, never returns to normal flow
+    cli
+.dh:
+    hlt
+    jmp .dh
 
 ; write_lba: AX = LBA, ES:BX = buffer. Writes 1 sector.
 write_lba:
@@ -1863,10 +2115,12 @@ write_lba:
     popa
     ret
 .err:
-    mov si, msg_diskerr
-    call print
-    popa
-    ret
+    mov si, txt_io_disk
+    call panic                  ; fatal, never returns to normal flow
+    cli
+.dh:
+    hlt
+    jmp .dh
 
 ; load_fat: load the FAT table into fat_buf
 load_fat:
@@ -2089,6 +2343,8 @@ find_free_entry:
 ; BX wraps so files larger than 64KB keep loading.
 load_file:
 .next_cluster:
+    cmp ax, 2
+    jb .done                    ; cluster 0/1 = empty file, no data
     cmp ax, 0xFFF8
     jae .done
     mov [load_cluster], ax      ; save current cluster
@@ -2346,7 +2602,6 @@ prompt      db "> ", 0
 newline     db 13, 10, 0
 
 msg_unknown db "Unknown command. Type 'help'.", 13, 10, 0
-msg_diskerr db "Disk error!", 13, 10, 0
 txt_kb      db " KB conventional memory", 13, 10, 0
 txt_mb      db " MB extended memory", 13, 10, 0
 txt_reboot  db "Press any key to reboot...", 13, 10, 0
@@ -2391,6 +2646,30 @@ txt_time_set db "Time set.", 13, 10, 0
 txt_date_set db "Date set.", 13, 10, 0
 txt_usage_time db "Usage: time [HH:MM:SS]", 13, 10, 0
 txt_usage_date db "Usage: date [YYYY-MM-DD]", 13, 10, 0
+
+; fatal exception screen
+txt_fatal_bar  db "FATAL EXCEPTION", 0
+txt_panic_intro db 13, 10, "A fatal exception has occurred.", 13, 10, 13, 10
+               db "Reason: ", 0
+txt_panic_halt db 13, 10, "System halted. Press reset to reboot.", 13, 10, 0
+txt_io_disk    db "Disk I/O error (BIOS int 13 failed)", 0
+txt_exc_de     db "#DE Divide error (division by zero?)", 0
+txt_exc_ud     db "#UD Invalid opcode", 0
+txt_exc_unknown db "Unknown CPU exception", 0
+txt_dump_code  db "Error code: 0x", 0
+txt_dump_csip  db "CS:IP = 0x", 0
+txt_dump_sssp  db "SS:SP = 0x", 0
+txt_dump_flags db "  FLAGS=0x", 0
+txt_dump_gpr1  db "AX=0x", 0
+txt_lbl_bx     db "  BX=0x", 0
+txt_lbl_cx     db "  CX=0x", 0
+txt_lbl_dx     db "  DX=0x", 0
+txt_lbl_si     db "SI=0x", 0
+txt_lbl_di     db "  DI=0x", 0
+txt_lbl_bp     db "  BP=0x", 0
+txt_lbl_ds     db "DS=0x", 0
+txt_lbl_es     db "  ES=0x", 0
+txt_exc_unknown_vec db 13, 10, "Vector: 0x", 0
 txt_alias_off db "Unknown command. Type 'help'. This command is not a standard ROS command. Use 'alias -a true' to enable system alias.", 13, 10, 0
 
 txt_about   db "ROS Command - the command-line edition of ROS.", 13, 10
@@ -2487,6 +2766,25 @@ pck_data    dw 0
 pck_delcl   dw 0
 pck_next    dw 0
 pkg_name    times 11 db 0
+
+; fatal exception register dump
+reason_ptr  dw 0
+r_vec       dw 0
+r_code      dw 0
+r_ip        dw 0
+r_cs        dw 0
+r_flags     dw 0
+r_ax        dw 0
+r_bx        dw 0
+r_cx        dw 0
+r_dx        dw 0
+r_si        dw 0
+r_di        dw 0
+r_bp        dw 0
+r_sp        dw 0
+r_ds        dw 0
+r_es        dw 0
+r_ss        dw 0
 
 ; protected mode / memory detection state
 saved_sp    dw 0
