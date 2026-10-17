@@ -15,8 +15,17 @@
 %define FILE_SEG    0x3000    ; file load buffer (doc)
 %define BUF_SIZE    128
 %define PATH_SIZE   96
-%define VERSION     "0.6.0"
+%define VERSION     "0.7.0"
 %define MAX_FAT_SEC 64        ; fat_buf holds up to 64 sectors (32KB)
+
+; GDT selectors (descriptors are flat with base 0x10000,
+; matching where this ORG 0 kernel is physically loaded)
+%define PM32_CODE   0x08
+%define PM32_DATA   0x10
+%define PM16_CODE   0x18
+%define PM16_DATA   0x20
+%define HIGH_1MB    (0x100000 - 0x10000)   ; physical 1 MB
+%define HIGH_16MB   (0x1000000 - 0x10000)  ; physical 16 MB
 
 start:
     mov ax, KERNEL_SEG
@@ -28,6 +37,7 @@ start:
     mov sp, 0xFFFE
 
     call init_fs                ; parse BPB + load FAT into fat_buf
+    call detect_ram             ; E820 memory map + prepare GDT pointer
 
     call clear_screen
     mov si, banner
@@ -138,6 +148,9 @@ dispatch:
     mov si, name_pck
     call match
     je .pck
+    mov si, name_pm
+    call match
+    je .pm
     mov si, name_reboot
     call match
     je .reboot
@@ -225,6 +238,9 @@ dispatch:
     ret
 .pck:
     call cmd_pck
+    ret
+.pm:
+    call cmd_pm
     ret
 .reboot:
     call cmd_reboot
@@ -401,6 +417,13 @@ cmd_mem:
     call print_dec
     mov si, txt_kb
     call print
+    mov eax, [ram_mb]
+    test eax, eax
+    jz .no_ext
+    call print_dec32
+    mov si, txt_mb
+    call print
+.no_ext:
     ret
 
 cmd_reboot:
@@ -418,6 +441,272 @@ cmd_halt:
 .loop:
     hlt
     jmp .loop
+
+; --------------------------------------------
+; pm: enter 32-bit protected mode, run a
+; read/write test above 1 MB, return to real
+; mode and report the result.
+; --------------------------------------------
+cmd_pm:
+    call a20_enable
+    jc .a20_fail
+    mov si, txt_pm_enter
+    call print
+    mov [saved_sp], sp
+    mov byte [pm_ok], 1
+    cli
+    lgdt [gdt_ptr]
+    mov eax, cr0
+    or al, 1
+    mov cr0, eax
+    jmp dword PM32_CODE:pm32_entry
+.a20_fail:
+    mov si, txt_pm_a20
+    call print
+    ret
+
+; --- 32-bit protected mode code ---
+[BITS 32]
+pm32_entry:
+    mov ax, PM32_DATA
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    mov esp, pm_stack_top
+
+    ; test physical 1 MB (flat descriptor base is 0x10000)
+    mov edi, HIGH_1MB
+    mov esi, [edi]              ; save original dword
+    mov dword [edi], 0xDEADBEEF
+    cmp dword [edi], 0xDEADBEEF
+    jne .fail
+    mov dword [edi], 0x55AA55AA
+    cmp dword [edi], 0x55AA55AA
+    jne .fail
+    mov [edi], esi              ; restore
+
+    ; test physical 16 MB
+    mov edi, HIGH_16MB
+    mov esi, [edi]
+    mov dword [edi], 0xCAFEBABE
+    cmp dword [edi], 0xCAFEBABE
+    jne .fail
+    mov dword [edi], 0x0F0F0F0F
+    cmp dword [edi], 0x0F0F0F0F
+    jne .fail
+    mov [edi], esi
+
+    ; switch back: 16-bit data segments, then 16-bit code
+    mov ax, PM16_DATA
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    jmp PM16_CODE:pm16_entry
+.fail:
+    mov byte [pm_ok], 0
+    mov ax, PM16_DATA
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    jmp PM16_CODE:pm16_entry
+
+; --- back to 16-bit ---
+[BITS 16]
+pm16_entry:
+    mov eax, cr0
+    and al, 0xFE                ; clear PE (paging is off anyway)
+    mov cr0, eax
+    jmp KERNEL_SEG:pm_real
+pm_real:
+    mov ax, KERNEL_SEG
+    mov ds, ax
+    mov es, ax
+    xor ax, ax
+    mov fs, ax
+    mov gs, ax
+    mov ax, 0x9000
+    mov ss, ax
+    mov sp, [saved_sp]
+    sti
+    cmp byte [pm_ok], 1
+    jne .failed
+    mov si, txt_pm_ok
+    call print
+    ret
+.failed:
+    mov si, txt_pm_fail
+    call print
+    ret
+
+; --------------------------------------------
+; A20 gate
+; --------------------------------------------
+a20_check:                      ; CF=0 enabled, CF=1 disabled
+    pushf
+    push ds
+    push es
+    push si
+    push di
+    push ax
+    push bx
+    cli
+    xor ax, ax
+    mov es, ax                  ; 0000:0500 = physical 0x000500
+    mov ax, 0xFFFF
+    mov ds, ax                  ; FFFF:0510 = physical 0x100500
+    mov di, 0x0500
+    mov si, 0x0510
+    mov ax, [es:di]
+    mov bx, [ds:si]
+    push ax
+    push bx
+    mov word [es:di], 0x0000
+    mov word [ds:si], 0xFFFF
+    cmp word [es:di], 0xFFFF
+    je .off
+    pop bx
+    pop ax
+    mov [ds:si], bx
+    mov [es:di], ax
+    pop bx
+    pop ax
+    pop di
+    pop si
+    pop es
+    pop ds
+    popf
+    clc
+    ret
+.off:
+    pop bx
+    pop ax
+    mov [ds:si], bx
+    mov [es:di], ax
+    pop bx
+    pop ax
+    pop di
+    pop si
+    pop es
+    pop ds
+    popf
+    stc
+    ret
+
+a20_wait_in:                    ; wait for input buffer empty
+    in al, 0x64
+    test al, 2
+    jnz a20_wait_in
+    ret
+
+a20_wait_out:                   ; wait for output buffer full
+    in al, 0x64
+    test al, 1
+    jz a20_wait_out
+    ret
+
+a20_kbd:                        ; enable A20 via keyboard controller
+    call a20_wait_in
+    mov al, 0xD0                ; read output port
+    out 0x64, al
+    call a20_wait_out
+    in al, 0x60
+    push ax
+    call a20_wait_in
+    mov al, 0xD1                ; write output port
+    out 0x64, al
+    call a20_wait_in
+    pop ax
+    or al, 2
+    out 0x60, al
+    call a20_wait_in
+    ret
+
+a20_enable:                     ; CF=0 on success, CF=1 if still off
+    call a20_check
+    jnc .ok
+    in al, 0x92                 ; fast A20 (System Control Port)
+    test al, 2
+    jnz .check
+    or al, 2
+    and al, 0xFE                ; never pulse the reset bit
+    out 0x92, al
+.check:
+    call a20_check
+    jnc .ok
+    call a20_kbd
+    call a20_check
+.ok:
+    ret
+
+; --------------------------------------------
+; detect_ram: int 15h E820 memory map,
+; total usable RAM (rounded up to MB),
+; and physical address of the GDT.
+; --------------------------------------------
+detect_ram:
+    pusha
+    push es
+    mov ax, KERNEL_SEG
+    mov es, ax
+    xor ebx, ebx
+    mov word [e820_cnt], 0
+    mov di, e820_buf
+.next:
+    mov eax, 0xE820
+    mov ecx, 24
+    mov edx, 0x534D4150         ; "SMAP"
+    int 0x15
+    jc .map_done
+    cmp eax, 0x534D4150
+    jne .map_done
+    add di, 24
+    inc word [e820_cnt]
+    cmp bx, 0
+    je .map_done
+    cmp word [e820_cnt], 16
+    jb .next
+.map_done:
+    ; GDT descriptor needs an absolute physical base
+    mov eax, gdt_start
+    add eax, 0x10000
+    mov [gdt_ptr+2], eax
+    ; sum usable (type 1) region lengths
+    movzx si, word [e820_cnt]
+    mov di, e820_buf
+    xor ecx, ecx                ; total bytes (32-bit)
+.sum:
+    test si, si
+    jz .sum_done
+    cmp dword [es:di+16], 1
+    jne .skip
+    mov eax, [es:di+12]
+    test eax, eax               ; ignore regions extending past 4 GB
+    jnz .skip
+    mov eax, [es:di+8]
+    add ecx, eax
+.skip:
+    add di, 24
+    dec si
+    jmp .sum
+.sum_done:
+    ; round up to whole megabytes
+    add ecx, 0xFFFFF
+    jc .cap
+    shr ecx, 20
+    jmp .store
+.cap:
+    mov ecx, 0xFFFFFFFF
+.store:
+    mov [ram_mb], ecx
+    pop es
+    popa
+    ret
 
 ; --------------------------------------------
 ; dir / ls: list current directory entries
@@ -1860,6 +2149,26 @@ print_dec:                      ; AX = unsigned 16-bit -> print decimal
     popa
     ret
 
+print_dec32:                    ; EAX = unsigned 32-bit -> print decimal
+    pusha
+    mov ebx, 10
+    xor ecx, ecx
+.divide:
+    xor edx, edx
+    div ebx
+    push dx
+    inc cx
+    test eax, eax
+    jnz .divide
+.output:
+    pop dx
+    mov al, dl
+    add al, '0'
+    call print_char
+    loop .output
+    popa
+    ret
+
 ; --------------------------------------------
 ; Data
 ; --------------------------------------------
@@ -1887,6 +2196,7 @@ name_time   db "time", 0
 name_date   db "date", 0
 name_mem    db "mem", 0
 name_pck    db "pck", 0
+name_pm     db "pm", 0
 name_reboot db "reboot", 0
 name_halt   db "halt", 0
 
@@ -1904,6 +2214,7 @@ newline     db 13, 10, 0
 msg_unknown db "Unknown command. Type 'help'.", 13, 10, 0
 msg_diskerr db "Disk error!", 13, 10, 0
 txt_kb      db " KB conventional memory", 13, 10, 0
+txt_mb      db " MB extended memory", 13, 10, 0
 txt_reboot  db "Press any key to reboot...", 13, 10, 0
 txt_halt    db "System halted. It is now safe to power off.", 13, 10, 0
 txt_ver     db "ROS Command version ", VERSION, 13, 10, 0
@@ -1937,6 +2248,11 @@ txt_pck_rm  db "Package removed.", 13, 10, 0
 txt_list    db "list", 0
 txt_install db "install", 0
 txt_remove  db "remove", 0
+txt_pm_enter db "Entering 32-bit protected mode...", 13, 10, 0
+txt_pm_ok   db "Back in real mode. R/W test at 1 MB and 16 MB: OK.", 13, 10
+            db "32-bit PM works - the full 4 GB address space is reachable.", 13, 10, 0
+txt_pm_fail db "Protected mode high-memory test failed.", 13, 10, 0
+txt_pm_a20  db "Failed to enable A20 gate.", 13, 10, 0
 txt_alias_off db "Unknown command. Type 'help'. This command is not a standard ROS command. Use 'alias -a true' to enable system alias.", 13, 10, 0
 
 txt_about   db "ROS Command - the command-line edition of ROS.", 13, 10
@@ -1960,11 +2276,50 @@ txt_help    db "Available commands:", 13, 10
             db "  who     - show current user (alias: whoami)", 13, 10
             db "  alias   - alias -a [true|false]", 13, 10
             db "  pck     - packages: pck list / install / remove", 13, 10
+            db "  pm      - enter 32-bit protected mode / test high memory", 13, 10
             db "  time    - show current time", 13, 10
             db "  date    - show current date", 13, 10
             db "  mem     - show conventional memory", 13, 10
             db "  reboot  - reboot the system", 13, 10
             db "  halt    - halt the system", 13, 10, 0
+
+; --------------------------------------------
+; Global Descriptor Table (base 0x10000)
+; --------------------------------------------
+gdt_start:
+    dq 0                        ; null descriptor
+gdt_code32:                     ; 0x08 32-bit code, flat, 4 GB
+    dw 0xFFFF
+    dw 0x0000
+    db 0x01
+    db 0x9A
+    db 0xCF
+    db 0x00
+gdt_data32:                     ; 0x10 32-bit data, flat, 4 GB
+    dw 0xFFFF
+    dw 0x0000
+    db 0x01
+    db 0x92
+    db 0xCF
+    db 0x00
+gdt_code16:                     ; 0x18 16-bit code, 64 KB
+    dw 0xFFFF
+    dw 0x0000
+    db 0x01
+    db 0x9A
+    db 0x00
+    db 0x00
+gdt_data16:                     ; 0x20 16-bit data, 64 KB
+    dw 0xFFFF
+    dw 0x0000
+    db 0x01
+    db 0x92
+    db 0x00
+    db 0x00
+gdt_end:
+gdt_ptr:
+    dw gdt_end - gdt_start - 1
+    dd 0                        ; physical base, filled by detect_ram
 
 boot_drive  db 0
 aliases_on  db 1
@@ -1994,6 +2349,15 @@ pck_data    dw 0
 pck_delcl   dw 0
 pck_next    dw 0
 pkg_name    times 11 db 0
+
+; protected mode / memory detection state
+saved_sp    dw 0
+pm_ok       db 0
+e820_cnt    dw 0
+ram_mb      dd 0
+pm_stack    times 256 db 0
+pm_stack_top equ $
+e820_buf    times 24*16 db 0
 
 ; FAT16 runtime layout (parsed from the VBR's BPB by init_fs)
 part_base   dw 0                ; partition base LBA
