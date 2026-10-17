@@ -3,8 +3,11 @@
 #include "console.h"
 #include "timer.h"
 #include "keyboard.h"
+#include "sched.h"
+#include "syscall.h"
 
 extern void (*isr_table[48])(void);
+extern void syscall_entry(void);
 
 struct idt_entry {
     u16 off_lo;
@@ -22,14 +25,19 @@ struct idt_ptr {
 static struct idt_entry idt[256];
 static struct idt_ptr   idtp;
 
-static void idt_set(int n, void (*fn)(void))
+static void idt_set_flags(int n, void (*fn)(void), u8 flags)
 {
     u32 a = (u32)fn;
     idt[n].off_lo = a & 0xFFFF;
     idt[n].sel = 0x08;
     idt[n].zero = 0;
-    idt[n].flags = 0x8E;        /* present, ring0, 32-bit interrupt gate */
+    idt[n].flags = flags;
     idt[n].off_hi = (a >> 16) & 0xFFFF;
+}
+
+static void idt_set(int n, void (*fn)(void))
+{
+    idt_set_flags(n, fn, 0x8E); /* present, ring0, 32-bit interrupt gate */
 }
 
 void pic_remap(void)
@@ -82,6 +90,9 @@ void idt_init(void)
     for (int i = 48; i < 256; i++)
         idt_set(i, isr_table[0]);   /* unused: #DE */
 
+    /* int 0x80 must be callable from ring 3 */
+    idt_set_flags(0x80, syscall_entry, 0xEE);
+
     idtp.limit = sizeof(idt) - 1;
     idtp.base = (u32)&idt;
     __asm__ volatile("lidt %0" : : "m"(idtp));
@@ -130,18 +141,33 @@ void fatal_exception(regs_t *r)
         cpu_halt();
 }
 
-void isr_handler(regs_t *r)
+u32 isr_handler(regs_t *r)
 {
+    if (r->vec == 0x80)
+        return syscall_handler(r);
+
     if (r->vec < 32) {
+        if (r->vec == 14 && (r->cs & 3) == 3) {
+            u32 cr2;
+            __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+            con_printf("\n[%s] segmentation fault at 0x%x\n",
+                       sched_current_name(), cr2);
+            return sched_kill_current(r);
+        }
         fatal_exception(r);
-    } else {
-        u32 irq = r->vec - 32;
-        if (irq == 0)
-            timer_tick();
-        else if (irq == 1)
-            keyboard_irq();
-        else if (irq == 7 || irq == 15)
-            return;             /* spurious */
-        irq_eoi((u8)irq);
+        return (u32)r;
     }
+
+    u32 irq = r->vec - 32;
+    if (irq == 7 || irq == 15)
+        return (u32)r;          /* spurious */
+    if (irq == 0)
+        timer_tick();
+    else if (irq == 1)
+        keyboard_irq();
+    irq_eoi((u8)irq);
+
+    if (irq == 0)
+        return sched_on_tick(r);
+    return (u32)r;
 }

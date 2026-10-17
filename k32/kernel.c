@@ -11,9 +11,22 @@
 #include "rtc.h"
 #include "pck.h"
 #include "net.h"
+#include "paging.h"
+#include "sched.h"
 
-#define VERSION "0.10.0"
+#define VERSION "0.12.0pre"
 #define LINE_MAX 128
+
+#define USER_MAX      16
+#define USER_NAME_MAX 12
+#define USER_REC      32
+#define USER_FILE     "USER.DAT"
+
+struct user {
+    char name[16];
+    u32  hash;
+    u8   admin;
+};
 
 struct e820_entry {
     u64 base;
@@ -29,6 +42,10 @@ extern u32 boot_conv_kb;
 static char cmdline[LINE_MAX];
 static int aliases_on = 1;
 static int fs_ok;
+
+static struct user users[USER_MAX];
+static int user_count;
+static int cur_user;
 
 /* ---- line input ---- */
 static void read_line(char *buf, int max)
@@ -62,6 +79,139 @@ static void read_line(char *buf, int max)
             con_putc((char)c);
         }
     }
+}
+
+static void read_secret(char *buf, int max)
+{
+    int n = 0;
+    for (;;) {
+        int c = kbd_waitchar();
+        if (c == '\n') {
+            con_putc('\n');
+            buf[n] = 0;
+            return;
+        }
+        if (c == '\b') {
+            if (n > 0) {
+                n--;
+                con_puts("\b \b");
+            }
+            continue;
+        }
+        if (c == 27) {
+            while (n > 0) {
+                n--;
+                con_puts("\b \b");
+            }
+            continue;
+        }
+        if (c < 32 || c > 126)
+            continue;
+        if (n < max - 1) {
+            buf[n++] = (char)c;
+            con_putc('*');
+        }
+    }
+}
+
+/* ---- users ---- */
+static u32 rd32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) |
+           ((u32)p[3] << 24);
+}
+
+static void wr32(u8 *p, u32 v)
+{
+    p[0] = (u8)v;
+    p[1] = (u8)(v >> 8);
+    p[2] = (u8)(v >> 16);
+    p[3] = (u8)(v >> 24);
+}
+
+static u32 hash_password(const char *s)
+{
+    u32 h = 5381;
+    if (!*s)
+        return 0;
+    while (*s)
+        h = h * 33 + (u8)*s++;
+    return h;
+}
+
+static int user_find(const char *name)
+{
+    for (int i = 0; i < user_count; i++) {
+        if (!strcasecmp(users[i].name, name))
+            return i;
+    }
+    return -1;
+}
+
+static void user_defaults(void)
+{
+    memset(users, 0, sizeof(users));
+    user_count = 0;
+    cur_user = 0;
+
+    strcpy(users[0].name, "root");
+    users[0].hash = 0;
+    users[0].admin = 1;
+    user_count = 1;
+}
+
+static void user_load(void)
+{
+    static u8 buf[USER_MAX * USER_REC];
+    struct fat_dirent de;
+
+    user_defaults();
+    if (!fs_ok)
+        return;
+    if (fs_find_at(0, USER_FILE, &de) < 0 || (de.attr & 0x10))
+        return;
+
+    int n = fs_read_file(&de, buf, sizeof(buf));
+    for (int off = 0; off + USER_REC <= n; off += USER_REC) {
+        u8 *r = buf + off;
+        char name[16];
+
+        if (!r[0])
+            continue;
+        strncpy(name, (const char *)r, 15);
+        name[15] = 0;
+
+        if (!strcasecmp(name, "root")) {
+            users[0].hash = rd32(r + 16);
+            continue;
+        }
+        if (user_find(name) >= 0 || user_count >= USER_MAX)
+            continue;
+
+        strcpy(users[user_count].name, name);
+        users[user_count].hash = rd32(r + 16);
+        users[user_count].admin = r[20] ? 1 : 0;
+        user_count++;
+    }
+}
+
+static int user_save(void)
+{
+    static u8 buf[USER_MAX * USER_REC];
+
+    if (!fs_ok)
+        return -1;
+
+    memset(buf, 0, sizeof(buf));
+    for (int i = 0; i < user_count; i++) {
+        u8 *r = buf + i * USER_REC;
+        strncpy((char *)r, users[i].name, 15);
+        wr32(r + 16, users[i].hash);
+        r[20] = users[i].admin;
+    }
+
+    fs_delete_at(0, USER_FILE);
+    return fs_create_at(0, USER_FILE, buf, (u32)user_count * USER_REC);
 }
 
 /* ---- helpers ---- */
@@ -110,31 +260,58 @@ static void split_name(const char *name, char *base, char *ext)
 }
 
 /* ---- commands ---- */
+static const char *const help_lines[] = {
+    "  help    - show this help",
+    "  about   - about ROS Command",
+    "  ver     - show version",
+    "  clear   - clear screen (alias: cls)",
+    "  echo    - print text, e.g. echo hello",
+    "  dir     - list files (alias: ls)",
+    "  doc     - show file contents (aliases: cat, type)",
+    "  mkdir   - create a directory",
+    "  touch   - create an empty file",
+    "  goto    - change directory (alias: cd)",
+    "  where   - show current path (alias: pwd)",
+    "  who     - show current user (alias: whoami)",
+    "  cru     - create a user, e.g. cru alice",
+    "  cu      - switch user, e.g. cu alice",
+    "  passwd  - set password, e.g. passwd alice",
+    "  alias   - alias -a [true|false]",
+    "  time    - show/set time, e.g. time 12:30:00",
+    "  date    - show/set date, e.g. date 2026-10-17",
+    "  mem     - show memory information",
+    "  pck     - packages: pck list / install / remove",
+    "  net     - show NE2000 network adapter",
+    "  ping    - ICMP echo, e.g. ping 10.0.2.2",
+    "  run     - run a user program, e.g. run user.bin",
+    "  ps      - list processes",
+    "  kill    - kill a process, e.g. kill 2",
+    "  vm      - show paging / virtual memory info",
+    "  crash   - trigger a fatal exception (test)",
+    "  reboot  - reboot the system",
+    "  halt    - halt the system",
+    NULL,
+};
+
 static void cmd_help(void)
 {
-    con_puts(
-        "  help    - show this help\n"
-        "  about   - about ROS Command\n"
-        "  ver     - show version\n"
-        "  clear   - clear screen (alias: cls)\n"
-        "  echo    - print text, e.g. echo hello\n"
-        "  dir     - list files (alias: ls)\n"
-        "  doc     - show file contents (aliases: cat, type)\n"
-        "  mkdir   - create a directory\n"
-        "  touch   - create an empty file\n"
-        "  goto    - change directory (alias: cd)\n"
-        "  where   - show current path (alias: pwd)\n"
-        "  who     - show current user (alias: whoami)\n"
-        "  alias   - alias -a [true|false]\n"
-        "  time    - show/set time, e.g. time 12:30:00\n"
-        "  date    - show/set date, e.g. date 2026-10-17\n"
-        "  mem     - show memory information\n"
-        "  pck     - packages: pck list / install / remove\n"
-        "  net     - show NE2000 network adapter\n"
-        "  ping    - ICMP echo, e.g. ping 10.0.2.2\n"
-        "  crash   - trigger a fatal exception (test)\n"
-        "  reboot  - reboot the system\n"
-        "  halt    - halt the system\n");
+    const int per_page = 20;
+    int shown = 0;
+
+    con_clear();
+    for (int i = 0; help_lines[i]; i++) {
+        if (shown == per_page) {
+            con_puts("-- more -- (any key: next, q: quit)");
+            int c = kbd_waitchar();
+            con_clear();
+            if (c == 27 || c == 'q' || c == 'Q')
+                return;
+            shown = 0;
+        }
+        con_puts(help_lines[i]);
+        con_putc('\n');
+        shown++;
+    }
 }
 
 static void cmd_about(void)
@@ -421,6 +598,208 @@ static void cmd_alias(const char *arg)
     con_puts("Usage: alias -a [true|false]\n");
 }
 
+/* ---- users ---- */
+static void cmd_cru(const char *name)
+{
+    char pw[32], pw2[32], ans[8];
+
+    if (!name) {
+        con_puts("Usage: cru <username>\n");
+        return;
+    }
+    if (!fs_ok) {
+        con_puts("No filesystem.\n");
+        return;
+    }
+    if (!users[cur_user].admin) {
+        con_puts("Permission denied. Only an admin can create users.\n");
+        return;
+    }
+    if (strlen(name) > USER_NAME_MAX) {
+        con_puts("Username too long (max 12 characters).\n");
+        return;
+    }
+    if (user_find(name) >= 0) {
+        con_puts("User already exists.\n");
+        return;
+    }
+    if (user_count >= USER_MAX) {
+        con_puts("User table is full.\n");
+        return;
+    }
+
+    con_puts("Password (empty for none): ");
+    read_secret(pw, sizeof(pw));
+    if (pw[0]) {
+        con_puts("Confirm password: ");
+        read_secret(pw2, sizeof(pw2));
+        if (strcmp(pw, pw2) != 0) {
+            con_puts("Passwords do not match.\n");
+            return;
+        }
+    }
+
+    con_puts("Make admin? (y/N): ");
+    read_line(ans, sizeof(ans));
+
+    struct user *u = &users[user_count];
+    memset(u, 0, sizeof(*u));
+    strcpy(u->name, name);
+    u->hash = hash_password(pw);
+    u->admin = (ans[0] == 'y' || ans[0] == 'Y');
+    user_count++;
+
+    if (user_save() < 0) {
+        user_count--;
+        con_puts("Cannot save user database.\n");
+        return;
+    }
+    con_printf("User '%s' created.\n", u->name);
+}
+
+static void cmd_cu(const char *name)
+{
+    if (!name) {
+        con_puts("Usage: cu <username>\n");
+        return;
+    }
+
+    int idx = user_find(name);
+    if (idx < 0) {
+        con_puts("No such user.\n");
+        return;
+    }
+
+    if (users[idx].hash) {
+        char pw[32];
+        con_puts("Password: ");
+        read_secret(pw, sizeof(pw));
+        if (hash_password(pw) != users[idx].hash) {
+            con_puts("Login incorrect.\n");
+            return;
+        }
+    }
+
+    cur_user = idx;
+    con_printf("Switched to '%s'.\n", users[cur_user].name);
+}
+
+static void cmd_passwd(const char *name)
+{
+    char old[32], pw[32], pw2[32];
+
+    if (!fs_ok) {
+        con_puts("No filesystem.\n");
+        return;
+    }
+
+    int idx = name ? user_find(name) : cur_user;
+    if (idx < 0) {
+        con_puts("No such user.\n");
+        return;
+    }
+    if (idx != cur_user && !users[cur_user].admin) {
+        con_puts("Permission denied.\n");
+        return;
+    }
+
+    if (idx == cur_user && users[idx].hash) {
+        con_puts("Current password: ");
+        read_secret(old, sizeof(old));
+        if (hash_password(old) != users[idx].hash) {
+            con_puts("Incorrect password.\n");
+            return;
+        }
+    }
+
+    con_puts("New password (empty for none): ");
+    read_secret(pw, sizeof(pw));
+    if (pw[0]) {
+        con_puts("Confirm password: ");
+        read_secret(pw2, sizeof(pw2));
+        if (strcmp(pw, pw2) != 0) {
+            con_puts("Passwords do not match.\n");
+            return;
+        }
+    }
+
+    users[idx].hash = hash_password(pw);
+    if (user_save() < 0) {
+        con_puts("Cannot save user database.\n");
+        return;
+    }
+    con_printf("Password for '%s' changed.\n", users[idx].name);
+}
+
+/* ---- processes ---- */
+static u8 prog_buf[32 * 1024];
+
+static void cmd_run(const char *arg)
+{
+    struct fat_dirent de;
+
+    if (!arg) {
+        con_puts("Usage: run <file>\n");
+        return;
+    }
+    if (!fs_ok || fs_find(arg, &de) < 0) {
+        con_puts("File not found.\n");
+        return;
+    }
+    if (de.attr & 0x10) {
+        con_puts("Is a directory.\n");
+        return;
+    }
+    if (de.size > sizeof(prog_buf)) {
+        con_puts("Program too large.\n");
+        return;
+    }
+
+    int n = fs_read_file(&de, prog_buf, sizeof(prog_buf));
+    if (n != (int)de.size) {
+        con_puts("Cannot read program.\n");
+        return;
+    }
+
+    int pid = sched_spawn(arg, prog_buf, (u32)n);
+    if (pid < 0) {
+        if (pid == -1)
+            con_puts("Process table is full.\n");
+        else if (pid == -2)
+            con_puts("Invalid program.\n");
+        else
+            con_puts("Out of memory.\n");
+        return;
+    }
+    con_printf("Started '%s' as pid %d.\n", arg, pid);
+}
+
+static void cmd_kill(const char *arg)
+{
+    if (!arg) {
+        con_puts("Usage: kill <pid>\n");
+        return;
+    }
+    int rc = sched_kill(atoi(arg));
+    if (rc == 0)
+        con_printf("Process %d killed.\n", atoi(arg));
+    else if (rc == -2)
+        con_puts("No such process.\n");
+    else
+        con_puts("Cannot kill this process.\n");
+}
+
+static void cmd_vm(void)
+{
+    con_puts("Paging: enabled (CR0.PG)\n");
+    con_printf("Kernel CR3: 0x%x\n", paging_kernel_cr3());
+    con_printf("Frames: %u used / %u total (%u KB free)\n",
+               paging_frame_used(), paging_frame_total(),
+               (paging_frame_total() - paging_frame_used()) * 4);
+    con_printf("User code VA:  0x%x\n", USER_CODE_VA);
+    con_printf("User stack VA: 0x%x\n", USER_STACK_VA);
+}
+
 static volatile int crash_zero;
 
 static void cmd_crash(void)
@@ -496,7 +875,13 @@ static void dispatch(char *line)
         cmd_mem();
     } else if (!strcmp(line, "who") ||
                (!strcmp(line, "whoami") && aliases_on)) {
-        con_puts("root\n");
+        con_printf("%s\n", users[cur_user].name);
+    } else if (!strcmp(line, "cru")) {
+        cmd_cru(arg);
+    } else if (!strcmp(line, "cu")) {
+        cmd_cu(arg);
+    } else if (!strcmp(line, "passwd")) {
+        cmd_passwd(arg);
     } else if (!strcmp(line, "alias")) {
         cmd_alias(arg);
     } else if (!strcmp(line, "pck")) {
@@ -505,6 +890,14 @@ static void dispatch(char *line)
         net_info();
     } else if (!strcmp(line, "ping")) {
         cmd_ping(arg);
+    } else if (!strcmp(line, "run")) {
+        cmd_run(arg);
+    } else if (!strcmp(line, "ps")) {
+        sched_ps();
+    } else if (!strcmp(line, "kill")) {
+        cmd_kill(arg);
+    } else if (!strcmp(line, "vm")) {
+        cmd_vm();
     } else if (!strcmp(line, "crash")) {
         cmd_crash();
     } else if (!strcmp(line, "reboot")) {
@@ -530,6 +923,8 @@ void kmain(void)
     idt_init();
     timer_init();
     keyboard_init();
+    paging_init();
+    sched_init();
     irq_unmask(0);
     irq_unmask(1);
     __asm__ volatile("sti");
@@ -545,10 +940,13 @@ void kmain(void)
     if (!fs_ok)
         con_puts("Warning: no FAT16 filesystem found.\n\n");
 
+    user_load();
     net_init();
 
     for (;;) {
         con_puts("xsh:ROS");
+        con_puts(" ");
+        con_puts(users[cur_user].name);
         con_puts(" ");
         con_puts(fs_cwd());
         con_puts("> ");

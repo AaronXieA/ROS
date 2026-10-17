@@ -65,6 +65,15 @@ isr%+v:
 %assign v v+1
 %endrep
 
+; int 0x80: system call gate (DPL 3)
+global syscall_entry
+syscall_entry:
+    push dword 0
+    push dword 0x80
+    jmp isr_common
+
+; isr_handler returns the stack pointer to resume from, so the
+; scheduler can switch to another task inside the interrupt.
 isr_common:
     pusha
     push ds
@@ -79,6 +88,7 @@ isr_common:
     push esp                    ; regs_t *
     call isr_handler
     add esp, 4
+    mov esp, eax                ; possibly another task's frame
     pop gs
     pop fs
     pop es

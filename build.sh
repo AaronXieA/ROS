@@ -22,6 +22,9 @@ mkdir -p build/obj
 nasm -f bin mbr.asm  -o build/mbr.bin
 nasm -f bin vbr.asm  -o build/vbr.bin
 
+# ring-3 demo program (flat binary, linked at virtual address 0x40000000)
+nasm -f bin user/user.asm -o build/USER.BIN
+
 # ---- 32-bit kernel: asm entry + C sources ----
 nasm -f elf32 k32/boot.asm -o build/obj/boot.o
 nasm -f elf32 k32/isr.asm  -o build/obj/isr.o
@@ -60,6 +63,7 @@ mformat -i build/ros.img@@${PARTOFF} -h 16 -s 63 -c 4 -r 32 -B build/vbr.bin ::
 
 # copy kernel and sample files into the partition
 mcopy -i build/ros.img@@${PARTOFF} -o build/kernel.bin ::KERNEL.BIN
+mcopy -i build/ros.img@@${PARTOFF} -o build/USER.BIN ::USER.BIN
 
 for f in files/*; do
     if [ -d "$f" ]; then

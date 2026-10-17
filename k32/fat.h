@@ -19,8 +19,10 @@ int  fs_find_at(u16 dir, const char *name, struct fat_dirent *out);
 int  fs_read_file(const struct fat_dirent *de, u8 *dst, u32 max);
 int  fs_print_file(const struct fat_dirent *de);
 int  fs_create(const char *name, const u8 *data, u32 size);
+int  fs_create_at(u16 dir, const char *name, const u8 *data, u32 size);
 int  fs_mkdir(const char *name);
 int  fs_delete(const char *name);
+int  fs_delete_at(u16 dir, const char *name);
 int  fs_cd(const char *name);
 const char *fs_cwd(void);
 

@@ -390,19 +390,19 @@ static int find_free_slot(u32 *slot, u32 *end_off)
     return (last + 32 <= dir_bytes) ? 0 : -1;
 }
 
-int fs_create(const char *name, const u8 *data, u32 size)
+int fs_create_at(u16 dir, const char *name, const u8 *data, u32 size)
 {
     u8 raw[11];
     make83(name, raw);
 
-    if (!ready || dir_load(cwd_cluster) < 0)
+    if (!ready || dir_load(dir) < 0)
         return -1;
 
     struct fat_dirent tmp;
-    if (fs_find(name, &tmp) == 0)
+    if (fs_find_at(dir, name, &tmp) == 0)
         return -2;              /* already exists */
 
-    if (dir_load(cwd_cluster) < 0)      /* fs_find reloaded the buffer */
+    if (dir_load(dir) < 0)      /* fs_find_at reloaded the buffer */
         return -1;
 
     u32 slot, end;
@@ -447,6 +447,11 @@ int fs_create(const char *name, const u8 *data, u32 size)
     if (fat_flush() < 0)
         return -6;
     return 0;
+}
+
+int fs_create(const char *name, const u8 *data, u32 size)
+{
+    return fs_create_at(cwd_cluster, name, data, size);
 }
 
 int fs_mkdir(const char *name)
@@ -501,12 +506,12 @@ int fs_mkdir(const char *name)
     return 0;
 }
 
-int fs_delete(const char *name)
+int fs_delete_at(u16 dir, const char *name)
 {
     u8 raw[11];
     make83(name, raw);
 
-    if (!ready || dir_load(cwd_cluster) < 0)
+    if (!ready || dir_load(dir) < 0)
         return -1;
 
     for (u32 off = 0; off + 32 <= dir_bytes; off += 32) {
@@ -528,6 +533,11 @@ int fs_delete(const char *name)
         return 0;
     }
     return -1;
+}
+
+int fs_delete(const char *name)
+{
+    return fs_delete_at(cwd_cluster, name);
 }
 
 /* ---- current directory ---- */
