@@ -15,7 +15,7 @@
 %define FILE_SEG    0x3000    ; file load buffer (doc)
 %define BUF_SIZE    128
 %define PATH_SIZE   96
-%define VERSION     "0.8.1"
+%define VERSION     "0.9.0"
 %define MAX_FAT_SEC 64        ; fat_buf holds up to 64 sectors (32KB)
 
 ; GDT selectors (descriptors are flat with base 0x10000,
@@ -146,6 +146,12 @@ dispatch:
     mov si, name_mem
     call match
     je .mem
+    mov si, name_net
+    call match
+    je .net
+    mov si, name_ping
+    call match
+    je .ping
     mov si, name_pck
     call match
     je .pck
@@ -236,6 +242,12 @@ dispatch:
     ret
 .mem:
     call cmd_mem
+    ret
+.net:
+    call cmd_net
+    ret
+.ping:
+    call cmd_ping
     ret
 .pck:
     call cmd_pck
@@ -574,6 +586,1140 @@ cmd_halt:
 .loop:
     hlt
     jmp .loop
+
+; ============================================
+; NE2000 (RTL8029) network driver
+; PCI, PIO, polling only - no interrupts.
+; ============================================
+%define NE_CMD      0x00
+%define NE_PSTART   0x01
+%define NE_PSTOP    0x02
+%define NE_BNRY     0x03
+%define NE_TPSR     0x04
+%define NE_TBCR0    0x05
+%define NE_TBCR1    0x06
+%define NE_ISR      0x07
+%define NE_RSAR0    0x08
+%define NE_RSAR1    0x09
+%define NE_RBCR0    0x0A
+%define NE_RBCR1    0x0B
+%define NE_RCR      0x0C
+%define NE_TCR      0x0D
+%define NE_DCR      0x0E
+%define NE_IMR      0x0F
+%define NE_DATA     0x10
+%define NE_PAR0     0x01        ; page 1
+%define NE_CURR     0x07        ; page 1
+%define NE_MAR0     0x08        ; page 1
+
+%define NE_TX_PAGE  0x40        ; transmit buffer page
+%define NE_RX_START 0x46        ; ring start page
+%define NE_RX_STOP  0x80        ; ring end page (exclusive)
+%define NE_PROM     32          ; PROM bytes to read
+
+; --- port helpers -------------------------------------------------
+ne_out:                         ; AL = value, DX = register offset
+    push dx
+    add dx, [net_base]
+    out dx, al
+    pop dx
+    ret
+
+ne_in:                          ; DX = register offset -> AL
+    push dx
+    add dx, [net_base]
+    in al, dx
+    pop dx
+    ret
+
+; --- PCI config space (mechanism #1) ------------------------------
+pci_addr:                       ; AX = dev/fn word, DX = reg -> EAX
+    movzx eax, ax
+    or eax, 0x80000000
+    movzx edx, dx
+    or eax, edx
+    ret
+
+pci_cfg_read:                   ; EAX = address -> EAX = data
+    push dx
+    push eax
+    mov dx, 0x0CF8
+    out dx, eax
+    mov dx, 0x0CFC
+    in eax, dx
+    mov [pci_val], eax
+    pop eax
+    mov eax, [pci_val]
+    pop dx
+    ret
+
+pci_cfg_write:                  ; EAX = address, EBX = data
+    push dx
+    push eax
+    mov dx, 0x0CF8
+    out dx, eax
+    mov dx, 0x0CFC
+    mov eax, ebx
+    out dx, eax
+    pop eax
+    pop dx
+    ret
+
+; find the RTL8029 (10EC:8029) on bus 0.
+net_find_pci:
+    xor bx, bx                  ; devfn = dev << 11
+    mov cx, 32
+.dev:
+    mov ax, bx
+    xor dx, dx
+    call pci_addr
+    call pci_cfg_read
+    cmp ax, 0x10EC
+    jne .next
+    shr eax, 16
+    cmp ax, 0x8029
+    je .found
+.next:
+    add bx, 0x0800
+    loop .dev
+    stc
+    ret
+.found:
+    mov [net_devfn], bx
+    clc
+    ret
+
+; --- card setup ---------------------------------------------------
+ne_hw_reset:
+    mov dx, NE_CMD
+    mov al, 0x21                ; stop, page 0
+    call ne_out
+    mov dx, NE_ISR
+    mov al, 0xFF                ; ack all
+    call ne_out
+    mov cx, 0x2000
+.d:
+    loop .d
+    ret
+
+; read the 32-byte PROM; first 6 bytes are the MAC
+ne_read_mac:
+    push es
+    mov ax, ds
+    mov es, ax
+    cld
+    mov dx, NE_CMD
+    mov al, 0x21
+    call ne_out
+    mov dx, NE_DCR
+    mov al, 0x48                ; byte-wide transfers
+    call ne_out
+    mov dx, NE_ISR
+    mov al, 0xFF
+    call ne_out
+    mov dx, NE_RSAR0
+    xor al, al
+    call ne_out
+    mov dx, NE_RSAR1
+    xor al, al
+    call ne_out
+    mov dx, NE_RBCR0
+    mov al, NE_PROM
+    call ne_out
+    mov dx, NE_RBCR1
+    xor al, al
+    call ne_out
+    mov dx, NE_CMD
+    mov al, 0x0A                ; remote read
+    call ne_out
+    mov di, prom_buf
+    mov cx, NE_PROM
+    mov dx, NE_DATA
+.r:
+    call ne_in
+    stosb
+    loop .r
+    ; Some cards (and QEMU) return each PROM byte twice. Detect that
+    ; by looking at the first three pairs, then take every other byte.
+    mov al, [prom_buf]
+    cmp al, [prom_buf+1]
+    jne .plain
+    mov al, [prom_buf+2]
+    cmp al, [prom_buf+3]
+    jne .plain
+    mov al, [prom_buf+4]
+    cmp al, [prom_buf+5]
+    jne .plain
+    mov si, prom_buf
+    mov di, net_mac
+    mov cx, 6
+.m2:
+    mov al, [si]
+    mov [di], al
+    add si, 2
+    inc di
+    loop .m2
+    jmp .mac_done
+.plain:
+    mov si, prom_buf
+    mov di, net_mac
+    mov cx, 6
+.m:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .m
+.mac_done:
+    mov dx, NE_CMD
+    mov al, 0x21
+    call ne_out
+    pop es
+    ret
+
+ne_chip_init:
+    ; --- page 0 ---
+    mov dx, NE_DCR
+    mov al, 0x48
+    call ne_out
+    mov dx, NE_RBCR0
+    xor al, al
+    call ne_out
+    mov dx, NE_RBCR1
+    xor al, al
+    call ne_out
+    mov dx, NE_RCR
+    mov al, 0x04                ; accept broadcast
+    call ne_out
+    mov dx, NE_TCR
+    xor al, al
+    call ne_out
+    mov dx, NE_TPSR
+    mov al, NE_TX_PAGE
+    call ne_out
+    mov dx, NE_PSTART
+    mov al, NE_RX_START
+    call ne_out
+    mov dx, NE_PSTOP
+    mov al, NE_RX_STOP
+    call ne_out
+    mov dx, NE_BNRY
+    mov al, NE_RX_START
+    call ne_out
+    mov dx, NE_IMR
+    xor al, al                  ; mask all interrupts
+    call ne_out
+    ; --- page 1: MAC, current page, multicast mask ---
+    mov dx, NE_CMD
+    mov al, 0x61                ; stop, page 1
+    call ne_out
+    mov si, net_mac
+    mov bx, NE_PAR0
+    mov cx, 6
+.p:
+    mov al, [si]
+    inc si
+    mov dx, bx
+    call ne_out
+    inc bx
+    loop .p
+    mov dx, NE_CURR
+    mov al, NE_RX_START+1
+    call ne_out
+    mov bx, NE_MAR0
+    mov cx, 8
+.mm:
+    mov dx, bx
+    mov al, 0xFF
+    call ne_out
+    inc bx
+    loop .mm
+    ; --- back to page 0, start ---
+    mov dx, NE_CMD
+    mov al, 0x22                ; start, page 0
+    call ne_out
+    ret
+
+; --- remote DMA ---------------------------------------------------
+; ne_dma_write: AX = card address, DS:SI = data, CX = count
+ne_dma_write:
+    push ax
+    push cx
+    push si
+    mov [dma_addr], ax
+    mov [dma_len], cx
+    mov dx, NE_CMD
+    mov al, 0x21
+    call ne_out
+    mov dx, NE_ISR
+    mov al, 0xFF
+    call ne_out
+    mov dx, NE_RSAR0
+    mov al, [dma_addr]
+    call ne_out
+    mov dx, NE_RSAR1
+    mov al, [dma_addr+1]
+    call ne_out
+    mov dx, NE_RBCR0
+    mov al, [dma_len]
+    call ne_out
+    mov dx, NE_RBCR1
+    mov al, [dma_len+1]
+    call ne_out
+    mov dx, NE_CMD
+    mov al, 0x12                ; remote write
+    call ne_out
+    pop si
+    pop cx
+    mov dx, [net_base]
+    add dx, NE_DATA
+.l:
+    lodsb
+    out dx, al
+    loop .l
+    mov cx, 0xFFFF
+.w:
+    mov dx, NE_ISR
+    call ne_in
+    test al, 0x40                ; RDC
+    jnz .ok
+    loop .w
+.ok:
+    mov dx, NE_ISR
+    mov al, 0x40
+    call ne_out
+    pop ax
+    ret
+
+; ne_dma_read: AX = card address, ES:DI = dest, CX = count
+ne_dma_read:
+    push ax
+    push cx
+    push di
+    mov [dma_addr], ax
+    mov [dma_len], cx
+    mov dx, NE_CMD
+    mov al, 0x21
+    call ne_out
+    mov dx, NE_ISR
+    mov al, 0xFF
+    call ne_out
+    mov dx, NE_RSAR0
+    mov al, [dma_addr]
+    call ne_out
+    mov dx, NE_RSAR1
+    mov al, [dma_addr+1]
+    call ne_out
+    mov dx, NE_RBCR0
+    mov al, [dma_len]
+    call ne_out
+    mov dx, NE_RBCR1
+    mov al, [dma_len+1]
+    call ne_out
+    mov dx, NE_CMD
+    mov al, 0x0A                ; remote read
+    call ne_out
+    pop di
+    pop cx
+    cld
+    mov dx, [net_base]
+    add dx, NE_DATA
+.l:
+    in al, dx
+    stosb
+    loop .l
+    mov dx, NE_ISR
+    mov al, 0x40
+    call ne_out
+    pop ax
+    ret
+
+; --- transmit -----------------------------------------------------
+; ne_send: DS:SI = frame, CX = length (even). CF=1 on timeout.
+ne_send:
+    push cx
+    mov ax, NE_TX_PAGE*256
+    call ne_dma_write
+    pop cx
+    mov [dma_len], cx
+    mov dx, NE_TPSR
+    mov al, NE_TX_PAGE
+    call ne_out
+    mov dx, NE_TBCR0
+    mov al, [dma_len]
+    call ne_out
+    mov dx, NE_TBCR1
+    mov al, [dma_len+1]
+    call ne_out
+    mov dx, NE_ISR
+    mov al, 0x02
+    call ne_out
+    mov dx, NE_CMD
+    mov al, 0x26                ; nodma | transmit
+    call ne_out
+    mov cx, 0xFFFF
+.w:
+    mov dx, NE_ISR
+    call ne_in
+    test al, 0x02
+    jnz .ok
+    loop .w
+    stc
+    ret
+.ok:
+    mov dx, NE_ISR
+    mov al, 0x02
+    call ne_out
+    clc
+    ret
+
+; --- receive ------------------------------------------------------
+; ne_poll: copy one frame from the ring into pkt_buf.
+; CF=0 and CX = frame length when one was available.
+ne_poll:
+    push es
+    mov ax, ds
+    mov es, ax
+    mov dx, NE_ISR
+    call ne_in
+    test al, 0x01
+    jz .none
+    mov dx, NE_ISR
+    mov al, 0x01
+    call ne_out
+    mov dx, NE_BNRY
+    call ne_in
+    inc al                      ; next packet starts at BNRY+1
+    cmp al, NE_RX_STOP
+    jb .page_ok
+    mov al, NE_RX_START
+.page_ok:
+    mov [rx_page], al
+    ; 4-byte packet header
+    mov ah, al
+    xor al, al
+    mov di, rx_hdr
+    mov cx, 4
+    call ne_dma_read
+    mov al, [rx_hdr+2]
+    mov ah, [rx_hdr+3]
+    sub ax, 4
+    jbe .bad
+    mov [rx_len], ax
+    cmp ax, 1514
+    ja .bad
+    ; payload address = (page << 8) + 4
+    mov al, [rx_page]
+    xor ah, ah
+    shl ax, 8
+    add ax, 4
+    mov bx, ax
+    add ax, [rx_len]
+    cmp ax, NE_RX_STOP*256
+    ja .wrap
+    mov cx, [rx_len]
+    mov di, pkt_buf
+    mov ax, bx
+    call ne_dma_read
+    jmp .advance
+.wrap:
+    mov ax, NE_RX_STOP*256
+    sub ax, bx
+    mov [rx_first], ax
+    mov cx, ax
+    mov ax, bx
+    mov di, pkt_buf
+    call ne_dma_read
+    mov ax, [rx_len]
+    sub ax, [rx_first]
+    mov cx, ax
+    mov ax, NE_RX_START*256
+    mov di, pkt_buf
+    add di, [rx_first]
+    call ne_dma_read
+.advance:
+    mov al, [rx_hdr+1]
+    dec al
+    cmp al, NE_RX_START
+    jae .setb
+    mov al, NE_RX_STOP-1
+.setb:
+    mov dx, NE_BNRY
+    call ne_out
+    pop es
+    mov cx, [rx_len]
+    clc
+    ret
+.bad:
+    mov al, [rx_hdr+1]
+    dec al
+    cmp al, NE_RX_START
+    jae .setb2
+    mov al, NE_RX_STOP-1
+.setb2:
+    mov dx, NE_BNRY
+    call ne_out
+.none:
+    pop es
+    stc
+    ret
+
+; --- checksum: SI = data, CX = word count -> AX -------------------
+csum:
+    push bx
+    push dx
+    xor bx, bx
+    xor dx, dx
+.c:
+    add bx, [si]
+    adc dx, 0
+    add si, 2
+    loop .c
+    mov ax, bx
+    add ax, dx
+    adc ax, 0
+    not ax
+    pop dx
+    pop bx
+    ret
+
+; --- frame builders -----------------------------------------------
+; ARP request for ping_ip, broadcast
+arp_send_request:
+    mov di, tx_buf
+    mov al, 0xFF
+    mov cx, 6
+.bc:
+    mov [di], al
+    inc di
+    loop .bc
+    mov si, net_mac
+    mov cx, 6
+.c1:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .c1
+    mov word [di], 0x0608       ; ethertype 0x0806
+    add di, 2
+    mov word [di], 0x0100       ; htype 1
+    add di, 2
+    mov word [di], 0x0008       ; ptype 0x0800
+    add di, 2
+    mov byte [di], 6
+    inc di
+    mov byte [di], 4
+    inc di
+    mov word [di], 0x0100       ; oper 1 = request
+    add di, 2
+    mov si, net_mac
+    mov cx, 6
+.c2:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .c2
+    mov si, net_ip
+    mov cx, 4
+.c3:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .c3
+    xor al, al
+    mov cx, 6
+.c4:
+    mov [di], al
+    inc di
+    loop .c4
+    mov si, ping_ip
+    mov cx, 4
+.c5:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .c5
+    mov cx, 18                  ; pad to 60 bytes
+.c6:
+    mov byte [di], 0
+    inc di
+    loop .c6
+    mov si, tx_buf
+    mov cx, 60
+    jmp ne_send
+
+; ARP reply to the request in pkt_buf
+arp_send_reply:
+    mov di, tx_buf
+    mov si, pkt_buf+22          ; requester MAC -> eth dst
+    mov cx, 6
+.c1:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .c1
+    mov si, net_mac
+    mov cx, 6
+.c2:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .c2
+    mov word [di], 0x0608
+    add di, 2
+    mov word [di], 0x0100
+    add di, 2
+    mov word [di], 0x0008
+    add di, 2
+    mov byte [di], 6
+    inc di
+    mov byte [di], 4
+    inc di
+    mov word [di], 0x0200       ; oper 2 = reply
+    add di, 2
+    mov si, net_mac
+    mov cx, 6
+.c3:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .c3
+    mov si, net_ip
+    mov cx, 4
+.c4:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .c4
+    mov si, pkt_buf+22          ; target = requester
+    mov cx, 6
+.c5:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .c5
+    mov si, pkt_buf+28          ; their IP
+    mov cx, 4
+.c6:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .c6
+    mov cx, 18
+.c7:
+    mov byte [di], 0
+    inc di
+    loop .c7
+    mov si, tx_buf
+    mov cx, 60
+    jmp ne_send
+
+; ICMP echo request to ping_ip via arp_mac
+icmp_send:
+    mov di, tx_buf
+    mov si, arp_mac
+    mov cx, 6
+.c1:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .c1
+    mov si, net_mac
+    mov cx, 6
+.c2:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .c2
+    mov word [di], 0x0008       ; ethertype 0x0800
+    add di, 2
+    ; IPv4 header
+    mov byte [di], 0x45
+    mov byte [di+1], 0
+    mov word [di+2], 0x3C00     ; total length 60
+    mov ax, [ping_seq]
+    mov [di+4], ah              ; IP id (big endian)
+    mov [di+5], al
+    mov word [di+6], 0          ; id / fragment
+    mov byte [di+8], 64         ; ttl
+    mov byte [di+9], 1          ; ICMP
+    mov word [di+10], 0         ; checksum
+    mov si, net_ip
+    mov cx, 4
+.s1:
+    mov al, [si]
+    mov [di+12], al
+    inc si
+    inc di
+    loop .s1
+    mov di, tx_buf+14           ; restore (di was advanced)
+    mov si, ping_ip
+    mov cx, 4
+.d1:
+    mov al, [si]
+    mov [di+16], al
+    inc si
+    inc di
+    loop .d1
+    ; ICMP header
+    mov byte [tx_buf+34], 8     ; echo request
+    mov byte [tx_buf+35], 0
+    mov word [tx_buf+36], 0
+    mov word [tx_buf+38], 0x5352 ; 'R','S'
+    mov ax, [ping_seq]
+    mov [tx_buf+40], ah
+    mov [tx_buf+41], al
+    mov di, tx_buf+42
+    mov cx, 32
+.p:
+    mov byte [di], 0x41
+    inc di
+    loop .p
+    ; IP checksum
+    mov si, tx_buf+14
+    mov cx, 10
+    call csum
+    mov [tx_buf+24], ax         ; word store = network byte order
+    ; ICMP checksum
+    mov si, tx_buf+34
+    mov cx, 20
+    call csum
+    mov [tx_buf+36], ax
+    mov si, tx_buf
+    mov cx, 74
+    jmp ne_send
+
+; --- receive handlers ---------------------------------------------
+net_handle_frame:               ; pkt_buf / rx_len
+    cmp word [rx_len], 14
+    jb .ret
+    mov ax, [pkt_buf+12]
+    cmp ax, 0x0608
+    je .arp
+    cmp ax, 0x0008
+    je .ip
+.ret:
+    ret
+
+.arp:
+    cmp word [pkt_buf+20], 0x0100
+    je .arp_req
+    cmp word [pkt_buf+20], 0x0200
+    jne .ret
+    ; reply: does it carry the MAC for ping_ip?
+    mov si, pkt_buf+28
+    mov di, ping_ip
+    mov cx, 4
+.rc:
+    mov al, [si]
+    cmp al, [di]
+    jne .ret
+    inc si
+    inc di
+    loop .rc
+    mov si, pkt_buf+22
+    mov di, arp_mac
+    mov cx, 6
+.mc:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .mc
+    mov si, ping_ip
+    mov di, arp_ip
+    mov cx, 4
+.ic:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .ic
+    mov byte [arp_ok], 1
+    mov byte [pump_stop], 1
+    ret
+.arp_req:
+    ; is it asking for our address?
+    mov si, pkt_buf+38
+    mov di, net_ip
+    mov cx, 4
+.qc:
+    mov al, [si]
+    cmp al, [di]
+    jne .ret
+    inc si
+    inc di
+    loop .qc
+    call arp_send_reply
+    ret
+
+.ip:
+    cmp byte [pkt_buf+23], 1    ; ICMP
+    jne .ret
+    mov si, pkt_buf+30
+    mov di, net_ip
+    mov cx, 4
+.nc:
+    mov al, [si]
+    cmp al, [di]
+    jne .ret
+    inc si
+    inc di
+    loop .nc
+    cmp byte [pkt_buf+34], 0    ; echo reply
+    jne .ret
+    cmp word [pkt_buf+38], 0x5352
+    jne .ret
+    mov ah, [pkt_buf+40]
+    mov al, [pkt_buf+41]
+    mov [rx_seq], ax
+    mov al, [pkt_buf+22]
+    mov [rx_ttl], al
+    mov byte [ping_got], 1
+    mov byte [pump_stop], 1
+    ret
+
+; --- driver bring-up ----------------------------------------------
+net_init:
+    cmp byte [net_state], 0
+    jne .done
+    mov byte [net_state], 2     ; assume absent
+    call net_find_pci
+    jc .done
+    ; BAR0 (I/O space)
+    mov ax, [net_devfn]
+    mov dx, 0x10
+    call pci_addr
+    call pci_cfg_read
+    and ax, 0xFFFC
+    jnz .bar_ok
+    ; firmware left it unassigned - program 0x300 ourselves
+    mov ax, [net_devfn]
+    mov dx, 0x10
+    call pci_addr
+    mov ebx, 0x00000301
+    call pci_cfg_write
+    mov ax, 0x0300
+.bar_ok:
+    mov [net_base], ax
+    ; enable I/O decoding
+    mov ax, [net_devfn]
+    mov dx, 4
+    call pci_addr
+    call pci_cfg_read
+    or ax, 0x0001
+    mov ebx, eax
+    mov ax, [net_devfn]
+    mov dx, 4
+    call pci_addr
+    call pci_cfg_write
+    ; interrupt line (informational only, we poll)
+    mov ax, [net_devfn]
+    mov dx, 0x3C
+    call pci_addr
+    call pci_cfg_read
+    mov [net_irq], al
+    call ne_hw_reset
+    call ne_read_mac
+    call ne_chip_init
+    mov byte [net_state], 1
+.done:
+    ret
+
+; --- time / polling -----------------------------------------------
+ticks_get:                      ; AX = BIOS tick counter low word
+    push ds
+    mov ax, 0x0040
+    mov ds, ax
+    mov ax, [0x006C]
+    pop ds
+    ret
+
+net_pump:                       ; CX = ticks to wait, CF=0 if pump_stop hit
+    mov [pump_ticks], cx
+    mov byte [pump_stop], 0
+    call ticks_get
+    mov [pump_t0], ax
+.loop:
+    call ne_poll
+    jnc .frame
+.after:
+    cmp byte [pump_stop], 1
+    je .stop
+    call ticks_get
+    sub ax, [pump_t0]
+    cmp ax, [pump_ticks]
+    jb .loop
+    stc
+    ret
+.frame:
+    call net_handle_frame
+    jmp .after
+.stop:
+    clc
+    ret
+
+; --- ARP cache ----------------------------------------------------
+arp_resolve:                    ; CF=0 if arp_mac maps ping_ip
+    cmp byte [arp_ok], 0
+    je .try
+    mov si, ping_ip
+    mov di, arp_ip
+    mov cx, 4
+.c:
+    mov al, [si]
+    cmp al, [di]
+    jne .try
+    inc si
+    inc di
+    loop .c
+    clc
+    ret
+.try:
+    mov byte [arp_ok], 0
+    mov cx, 3
+.send:
+    push cx
+    call arp_send_request
+    mov cx, 18                  ; ~1 second
+    call net_pump
+    pop cx
+    cmp byte [arp_ok], 1
+    je .ok
+    loop .send
+    stc
+    ret
+.ok:
+    clc
+    ret
+
+; --- output helpers -----------------------------------------------
+print_ip:                       ; DI = 4-byte address
+    pusha
+    mov cx, 4
+.l:
+    mov al, [di]
+    xor ah, ah
+    call print_dec
+    inc di
+    dec cx
+    jz .done
+    mov al, '.'
+    call print_char
+    jmp .l
+.done:
+    popa
+    ret
+
+print_mac:
+    pusha
+    mov si, net_mac
+    mov cx, 6
+.l:
+    mov al, [si]
+    call print_hex8
+    inc si
+    dec cx
+    jz .done
+    mov al, ':'
+    call print_char
+    jmp .l
+.done:
+    popa
+    ret
+
+parse_ip:                       ; SI -> "a.b.c.d" into ping_ip
+    mov di, ping_ip
+    mov bp, 4
+.part:
+    xor bx, bx
+    xor cx, cx
+.digit:
+    mov al, [si]
+    cmp al, '0'
+    jb .endpart
+    cmp al, '9'
+    ja .endpart
+    sub al, '0'
+    mov ah, 0
+    push ax
+    mov ax, bx
+    mov dx, 10
+    mul dx
+    test dx, dx
+    jnz .popbad
+    mov bx, ax
+    pop ax
+    add bx, ax
+    inc si
+    inc cx
+    jmp .digit
+.endpart:
+    test cx, cx
+    jz .bad
+    cmp bx, 255
+    ja .bad
+    mov [di], bl
+    inc di
+    dec bp
+    jz .done
+    cmp byte [si], '.'
+    jne .bad
+    inc si
+    jmp .part
+.done:
+    mov al, [si]
+    test al, al
+    jz .ok
+    cmp al, ' '
+    jne .bad
+.ok:
+    clc
+    ret
+.popbad:
+    pop ax
+.bad:
+    stc
+    ret
+
+; --- commands -----------------------------------------------------
+cmd_net:
+    call net_init
+    cmp byte [net_state], 1
+    je .ok
+    mov si, txt_net_absent
+    call print
+    ret
+.ok:
+    mov si, txt_net_title
+    call print
+    mov si, txt_net_pci
+    call print
+    mov ax, 0x10EC
+    call print_hex16
+    mov al, ':'
+    call print_char
+    mov ax, 0x8029
+    call print_hex16
+    mov si, newline
+    call print
+    mov si, txt_net_io
+    call print
+    mov ax, [net_base]
+    call print_hex16
+    mov si, newline
+    call print
+    mov si, txt_net_irq
+    call print
+    xor ah, ah
+    mov al, [net_irq]
+    call print_dec
+    mov si, newline
+    call print
+    mov si, txt_net_mac
+    call print
+    call print_mac
+    mov si, newline
+    call print
+    mov si, txt_net_ip
+    call print
+    mov di, net_ip
+    call print_ip
+    mov si, txt_net_gw
+    call print
+    mov di, net_gw
+    call print_ip
+    mov si, newline
+    call print
+    mov si, txt_net_mode
+    call print
+    ret
+
+cmd_ping:
+    call get_arg
+    jz .usage
+    call parse_ip
+    jc .usage
+    call net_init
+    cmp byte [net_state], 1
+    jne .nonet
+    sti
+    mov si, txt_ping_hdr
+    call print
+    mov di, ping_ip
+    call print_ip
+    mov si, txt_ping_data
+    call print
+    mov word [ping_seq], 0
+    mov word [ping_recv], 0
+.next:
+    call arp_resolve
+    jc .noarp
+    mov byte [ping_got], 0
+    call icmp_send
+    mov cx, 18
+    call net_pump
+    cmp byte [ping_got], 1
+    jne .timeout
+    inc word [ping_recv]
+    mov si, txt_ping_reply
+    call print
+    mov di, ping_ip
+    call print_ip
+    mov si, txt_ping_seq
+    call print
+    mov ax, [ping_seq]
+    call print_dec
+    mov si, txt_ping_bytes
+    call print
+    xor ah, ah
+    mov al, [rx_ttl]
+    call print_dec
+    mov si, newline
+    call print
+    jmp .advance
+.timeout:
+    mov si, txt_ping_timeout
+    call print
+.advance:
+    inc word [ping_seq]
+    cmp word [ping_seq], 4
+    jb .next
+    mov si, newline
+    call print
+    mov ax, 4
+    call print_dec
+    mov si, txt_ping_tx
+    call print
+    mov ax, [ping_recv]
+    call print_dec
+    mov si, txt_ping_rx
+    call print
+    ret
+.noarp:
+    mov si, txt_ping_noarp
+    call print
+    ret
+.nonet:
+    mov si, txt_net_absent
+    call print
+    ret
+.usage:
+    mov si, txt_ping_usage
+    call print
+    ret
 
 ; --------------------------------------------
 ; Fatal exception framework
@@ -2585,6 +3731,8 @@ name_whoami db "whoami", 0
 name_time   db "time", 0
 name_date   db "date", 0
 name_mem    db "mem", 0
+name_net    db "net", 0
+name_ping   db "ping", 0
 name_pck    db "pck", 0
 name_pm     db "pm", 0
 name_reboot db "reboot", 0
@@ -2647,6 +3795,28 @@ txt_date_set db "Date set.", 13, 10, 0
 txt_usage_time db "Usage: time [HH:MM:SS]", 13, 10, 0
 txt_usage_date db "Usage: date [YYYY-MM-DD]", 13, 10, 0
 
+; network
+txt_net_absent db "No NE2000 PCI NIC found.", 13, 10
+               db "Start QEMU with -device ne2k_pci,netdev=n0.", 13, 10, 0
+txt_net_title db 13, 10, "Network adapter", 13, 10, 0
+txt_net_pci  db "  PCI:      10EC:", 0
+txt_net_io   db "  I/O base: 0x", 0
+txt_net_irq  db "  IRQ:      ", 0
+txt_net_mac  db "  MAC:      ", 0
+txt_net_ip   db "  IP:       ", 0
+txt_net_gw   db "  Gateway:  ", 0
+txt_net_mode db "  Mode:     polled PIO, no interrupts", 13, 10, 0
+txt_ping_usage db "Usage: ping <a.b.c.d>", 13, 10, 0
+txt_ping_hdr db "PING ", 0
+txt_ping_data db " 32 data bytes", 13, 10, 0
+txt_ping_reply db "Reply from ", 0
+txt_ping_seq db ": seq=", 0
+txt_ping_bytes db " bytes=32 ttl=", 0
+txt_ping_timeout db "Request timed out.", 13, 10, 0
+txt_ping_tx  db " packets transmitted, ", 0
+txt_ping_rx  db " received", 13, 10, 0
+txt_ping_noarp db "ARP failed: destination host unreachable.", 13, 10, 0
+
 ; fatal exception screen
 txt_fatal_bar  db "FATAL EXCEPTION", 0
 txt_panic_intro db 13, 10, "A fatal exception has occurred.", 13, 10, 13, 10
@@ -2697,6 +3867,8 @@ txt_help    db "Available commands:", 13, 10
             db "  time    - show/set time, e.g. time 12:30:00", 13, 10
             db "  date    - show/set date, e.g. date 2026-10-17", 13, 10
             db "  mem     - show conventional memory", 13, 10
+            db "  net     - show NE2000 network adapter", 13, 10
+            db "  ping    - ICMP echo, e.g. ping 10.0.2.2", 13, 10
             db "  reboot  - reboot the system", 13, 10
             db "  halt    - halt the system", 13, 10, 0
 
@@ -2801,6 +3973,37 @@ rtc_d       db 0
 pm_stack    times 256 db 0
 pm_stack_top equ $
 e820_buf    times 24*16 db 0
+
+; network driver state
+net_state   db 0                ; 0=unprobed 1=ready 2=absent
+net_base    dw 0
+net_devfn   dw 0
+net_irq     db 0
+net_mac     times 6 db 0
+net_ip      db 10,0,2,15
+net_gw      db 10,0,2,2
+ping_ip     times 4 db 0
+arp_ip      times 4 db 0
+arp_mac     times 6 db 0
+arp_ok      db 0
+ping_seq    dw 0
+ping_recv   dw 0
+ping_got    db 0
+rx_seq      dw 0
+rx_ttl      db 0
+dma_addr    dw 0
+dma_len     dw 0
+rx_page     db 0
+rx_len      dw 0
+rx_hdr      times 4 db 0
+rx_first    dw 0
+pump_ticks  dw 0
+pump_t0     dw 0
+pump_stop   db 0
+pci_val     dd 0
+prom_buf    times 32 db 0
+tx_buf      times 128 db 0
+pkt_buf     times 1600 db 0
 
 ; FAT16 runtime layout (parsed from the VBR's BPB by init_fs)
 part_base   dw 0                ; partition base LBA

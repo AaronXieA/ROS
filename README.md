@@ -9,9 +9,11 @@ By **XR Stu** — <https://xrst.uk>
 
 - Custom **MBR + FAT16 VBR** boot chain (no bootloader library)
 - FAT16 filesystem with read/write and subdirectories (changes persist)
-- xsh shell: `help`, `dir`, `doc`, `mkdir`, `touch`, `goto`, `echo`, `time`, `date`, `mem` and more
+- xsh shell: `help`, `dir`, `doc`, `mkdir`, `touch`, `goto`, `echo`, `time`, `date`, `mem`, `net`, `ping` and more
 - Command aliases: `cls`, `ls`, `cat`, `type`, `cd`, `pwd`, `whoami`
 - **pck** package manager: `pck list` / `pck install <name>` / `pck remove <name>`
+- **NE2000 (RTL8029) network driver**: PCI PIO, ARP + IPv4/ICMP, `ping 10.0.2.2`
+- 32-bit protected mode demo (`pm`) that tests memory above 1 MB
 - Runs in QEMU as a raw 32 MB hard disk image
 
 ## Requirements
