@@ -3,18 +3,41 @@
 # Builds a ~30MB virtual hard disk image:
 #   sector 0    = mbr.asm (MBR)
 #   partition   = FAT16 (LBA 2048) with VBR
-#   KERNEL.BIN  = kernel
+#   KERNEL.BIN  = 32-bit C kernel
 #   files/*     = extra files copied into the partition
 set -e
 cd "$(dirname "$0")"
 
 export MTOOLS_SKIP_CHECK=1
 
-mkdir -p build
+CC=${CC:-clang}
+LLD=$(command -v ld.lld || echo /opt/homebrew/opt/lld/bin/ld.lld)
+OBJCOPY=$(command -v llvm-objcopy || echo /opt/homebrew/opt/llvm/bin/llvm-objcopy)
+CFLAGS="-target i386-elf -m32 -O2 -ffreestanding -fno-pic -fno-pie \
+        -fno-stack-protector -fno-builtin -fno-asynchronous-unwind-tables \
+        -mno-sse -mno-sse2 -mno-mmx -msoft-float -Wall -Wextra -Ik32"
+
+mkdir -p build/obj
 
 nasm -f bin mbr.asm  -o build/mbr.bin
 nasm -f bin vbr.asm  -o build/vbr.bin
-nasm -f bin kernel.asm -o build/kernel.bin
+
+# ---- 32-bit kernel: asm entry + C sources ----
+nasm -f elf32 k32/boot.asm -o build/obj/boot.o
+nasm -f elf32 k32/isr.asm  -o build/obj/isr.o
+for src in k32/*.c; do
+    obj="build/obj/$(basename "$src" .c).o"
+    $CC $CFLAGS -c "$src" -o "$obj"
+done
+
+$LLD -m elf_i386 -T k32/link.ld -o build/kernel32.elf build/obj/*.o
+$OBJCOPY -O binary build/kernel32.elf build/kernel.bin
+
+KSZ=$(stat -f%z build/kernel.bin)
+if [ "$KSZ" -gt $((512 * 1024)) ]; then
+    echo "error: kernel is $KSZ bytes, must stay below 512 KB" >&2
+    exit 1
+fi
 
 for f in build/mbr.bin build/vbr.bin; do
     SZ=$(stat -f%z "$f")
@@ -64,4 +87,4 @@ if [ -d pkgsrc ]; then
     done
 fi
 
-echo "OK: build/ros.img (kernel $(stat -f%z build/kernel.bin) bytes)"
+echo "OK: build/ros.img (kernel $KSZ bytes)"

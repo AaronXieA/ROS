@@ -131,11 +131,15 @@ found:
     mov bx, [dest_off]
     mov cx, [sec_per_clus]
     call read_sectors
-    ; advance dest by spc*512 (kernel < 64KB, offset stays in range)
+    ; advance dest by spc*512; bump ES on every 64 KB boundary
+    ; (cluster size divides 64 KB, so a cluster never straddles one)
     mov ax, [sec_per_clus]
-    shl ax, 8                   ; spc * 256 ... need *512
-    shl ax, 1
+    shl ax, 8                   ; spc * 256
+    shl ax, 1                   ; spc * 512
     add [dest_off], ax
+    jnc .no_bump
+    add word [dest_seg], 0x1000
+.no_bump:
 
     pop ax                      ; current cluster
     mov bx, ax
