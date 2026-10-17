@@ -15,7 +15,7 @@
 %define FILE_SEG    0x3000    ; file load buffer (doc)
 %define BUF_SIZE    128
 %define PATH_SIZE   96
-%define VERSION     "0.7.0"
+%define VERSION     "0.8.0"
 %define MAX_FAT_SEC 64        ; fat_buf holds up to 64 sectors (32KB)
 
 ; GDT selectors (descriptors are flat with base 0x10000,
@@ -377,6 +377,45 @@ cmd_echo:
     ret
 
 cmd_time:
+    call get_arg
+    jz .show
+    ; --- set time: HH:MM:SS ---
+    call bcd2
+    jc .bad
+    mov [rtc_h], al
+    mov al, ':'
+    call expect_ch
+    jc .bad
+    call bcd2
+    jc .bad
+    mov [rtc_m], al
+    mov al, ':'
+    call expect_ch
+    jc .bad
+    call bcd2
+    jc .bad
+    mov [rtc_s], al
+    cmp byte [si], 0            ; argument must end here
+    jne .bad
+    mov al, [rtc_h]
+    cmp al, 0x23
+    ja .bad
+    mov al, [rtc_m]
+    cmp al, 0x59
+    ja .bad
+    mov al, [rtc_s]
+    cmp al, 0x59
+    ja .bad
+    mov ah, 0x03                ; set RTC time (BCD: CH=h CL=m DH=s DL=DST)
+    mov ch, [rtc_h]
+    mov cl, [rtc_m]
+    mov dh, [rtc_s]
+    xor dl, dl
+    int 0x1A
+    mov si, txt_time_set
+    call print
+    ret
+.show:
     mov ah, 0x02                ; BIOS get time (BCD: CH=h CL=m DH=s)
     int 0x1A
     mov al, ch
@@ -392,8 +431,55 @@ cmd_time:
     mov si, newline
     call print
     ret
+.bad:
+    mov si, txt_usage_time
+    call print
+    ret
 
 cmd_date:
+    call get_arg
+    jz .show
+    ; --- set date: YYYY-MM-DD ---
+    call bcd2                   ; century (first two digits)
+    jc .bad
+    mov [rtc_c], al
+    call bcd2                   ; year (last two digits)
+    jc .bad
+    mov [rtc_y], al
+    mov al, '-'
+    call expect_ch
+    jc .bad
+    call bcd2
+    jc .bad
+    mov [rtc_mo], al
+    mov al, '-'
+    call expect_ch
+    jc .bad
+    call bcd2
+    jc .bad
+    mov [rtc_d], al
+    cmp byte [si], 0
+    jne .bad
+    mov al, [rtc_mo]
+    test al, al
+    jz .bad
+    cmp al, 0x12
+    ja .bad
+    mov al, [rtc_d]
+    test al, al
+    jz .bad
+    cmp al, 0x31
+    ja .bad
+    mov ah, 0x05                ; set RTC date (BCD: CH=cent CL=yr DH=mo DL=day)
+    mov ch, [rtc_c]
+    mov cl, [rtc_y]
+    mov dh, [rtc_mo]
+    mov dl, [rtc_d]
+    int 0x1A
+    mov si, txt_date_set
+    call print
+    ret
+.show:
     mov ah, 0x04                ; BIOS get date (BCD: CH=cent CL=yr DH=mo DL=day)
     int 0x1A
     mov al, ch
@@ -410,6 +496,52 @@ cmd_date:
     call print_bcd
     mov si, newline
     call print
+    ret
+.bad:
+    mov si, txt_usage_date
+    call print
+    ret
+
+; --------------------------------------------
+; Argument parsing helpers for time/date
+; --------------------------------------------
+digit_val:                      ; ASCII in AL -> value 0..9, CF=1 if not a digit
+    sub al, '0'
+    jc .no
+    cmp al, 9
+    ja .no
+    clc
+    ret
+.no:
+    stc
+    ret
+
+bcd2:                           ; 2 digits at DS:SI -> BCD byte in AL, SI += 2
+    mov al, [si]
+    call digit_val
+    jc .bad
+    mov dl, al                  ; tens
+    mov al, [si+1]
+    call digit_val
+    jc .bad
+    shl dl, 4
+    or dl, al
+    add si, 2
+    mov al, dl
+    clc
+    ret
+.bad:
+    stc
+    ret
+
+expect_ch:                      ; AL = required char at DS:SI, SI += 1
+    cmp [si], al
+    jne .bad
+    inc si
+    clc
+    ret
+.bad:
+    stc
     ret
 
 cmd_mem:
@@ -2119,6 +2251,7 @@ print_field:                    ; print CX chars from [DI] (DS)
 
 print_bcd:                      ; AL = packed BCD byte -> print two digits
     push ax
+    push cx
     mov cl, al
     shr al, 4
     add al, '0'
@@ -2127,6 +2260,7 @@ print_bcd:                      ; AL = packed BCD byte -> print two digits
     and al, 0x0F
     add al, '0'
     call print_char
+    pop cx
     pop ax
     ret
 
@@ -2253,6 +2387,10 @@ txt_pm_ok   db "Back in real mode. R/W test at 1 MB and 16 MB: OK.", 13, 10
             db "32-bit PM works - the full 4 GB address space is reachable.", 13, 10, 0
 txt_pm_fail db "Protected mode high-memory test failed.", 13, 10, 0
 txt_pm_a20  db "Failed to enable A20 gate.", 13, 10, 0
+txt_time_set db "Time set.", 13, 10, 0
+txt_date_set db "Date set.", 13, 10, 0
+txt_usage_time db "Usage: time [HH:MM:SS]", 13, 10, 0
+txt_usage_date db "Usage: date [YYYY-MM-DD]", 13, 10, 0
 txt_alias_off db "Unknown command. Type 'help'. This command is not a standard ROS command. Use 'alias -a true' to enable system alias.", 13, 10, 0
 
 txt_about   db "ROS Command - the command-line edition of ROS.", 13, 10
@@ -2277,8 +2415,8 @@ txt_help    db "Available commands:", 13, 10
             db "  alias   - alias -a [true|false]", 13, 10
             db "  pck     - packages: pck list / install / remove", 13, 10
             db "  pm      - enter 32-bit protected mode / test high memory", 13, 10
-            db "  time    - show current time", 13, 10
-            db "  date    - show current date", 13, 10
+            db "  time    - show/set time, e.g. time 12:30:00", 13, 10
+            db "  date    - show/set date, e.g. date 2026-10-17", 13, 10
             db "  mem     - show conventional memory", 13, 10
             db "  reboot  - reboot the system", 13, 10
             db "  halt    - halt the system", 13, 10, 0
@@ -2355,6 +2493,13 @@ saved_sp    dw 0
 pm_ok       db 0
 e820_cnt    dw 0
 ram_mb      dd 0
+rtc_h       db 0
+rtc_m       db 0
+rtc_s       db 0
+rtc_c       db 0
+rtc_y       db 0
+rtc_mo      db 0
+rtc_d       db 0
 pm_stack    times 256 db 0
 pm_stack_top equ $
 e820_buf    times 24*16 db 0
