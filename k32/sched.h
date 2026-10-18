@@ -13,6 +13,9 @@ int  sched_kill(int pid);
 void sched_ps(void);
 int  sched_current_pid(void);
 const char *sched_current_name(void);
+int  sched_alive(int pid);
+void sched_wait(int pid);
+u32  sched_brk(u32 addr);
 
 /* Return the stack pointer to resume from (used by the interrupt stubs) */
 u32  sched_on_tick(regs_t *r);

@@ -56,7 +56,9 @@ static u8 txbuf[1600];
 #define TCP_PSH 0x08
 #define TCP_ACK 0x10
 
-#define TCP_RXBUF_SIZE (72 * 1024)
+/* 32 KB is enough to smooth NE2000 bursts without letting .bss grow into
+ * the boot stack at 0x9F000 (see the ASSERT in k32/link.ld). */
+#define TCP_RXBUF_SIZE (32 * 1024)
 #define TCP_WINDOW     8192
 
 static u32 tcp_remote_ip;

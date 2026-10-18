@@ -2,6 +2,7 @@
 #include "ata.h"
 #include "string.h"
 #include "console.h"
+#include "keyboard.h"
 
 #define SEC 512
 
@@ -348,11 +349,15 @@ int fs_read_file(const struct fat_dirent *de, u8 *dst, u32 max)
     return (int)got;
 }
 
-int fs_print_file(const struct fat_dirent *de)
+/* per_page > 0 pauses after that many lines, like help.
+ * Returns 1 if the file ended with a newline, 0 otherwise, -1 if the
+ * reader pressed q/ESC at a "-- more --" prompt. */
+static int print_file(const struct fat_dirent *de, int per_page)
 {
     u32 left = de->size;
     u16 c = de->cluster;
     char last = 0;
+    int lines = 0;
 
     if (!ready || !c)
         return 0;
@@ -363,15 +368,37 @@ int fs_print_file(const struct fat_dirent *de)
         u32 n = left > fs.cluster_size ? fs.cluster_size : left;
         for (u32 i = 0; i < n; i++) {
             char ch = (char)clus_tmp[i];
+
+            if (per_page > 0 && lines >= per_page) {
+                con_puts("-- more -- (any key: next, q: quit)");
+                int k = kbd_waitchar();
+                if (k == 27 || k == 'q' || k == 'Q')
+                    return -1;
+                con_clear();
+                lines = 0;
+            }
+
             last = ch;
-            if (ch == '\n')
+            if (ch == '\n') {
+                lines++;
                 con_putc('\r');
+            }
             con_putc(ch);
         }
         left -= n;
         c = fat_get(c);
     }
     return last == '\n';
+}
+
+int fs_print_file(const struct fat_dirent *de)
+{
+    return print_file(de, 0);
+}
+
+int fs_print_file_paged(const struct fat_dirent *de, int per_page)
+{
+    return print_file(de, per_page > 0 ? per_page : 20);
 }
 
 /* ---- creation / deletion ---- */

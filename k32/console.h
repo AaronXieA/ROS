@@ -10,6 +10,10 @@ void con_putc(char c);
 void con_puts(const char *s);
 void con_printf(const char *fmt, ...);
 void con_set_color(u8 color);
+
+/* direct screen access for user programs (via int 0x80) */
+void con_putat(int r, int c, char ch, u8 color);
+void con_setpos(int r, int c);
 void con_fatal_banner(void);
 
 /* output capture, used by shell redirection and pipes */

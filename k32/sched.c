@@ -22,6 +22,8 @@ struct task {
     u32  esp;
     u32  cr3;
     u32  kstack_top;
+    u32  brk_base;      /* first heap VA (right after the code pages) */
+    u32  brk;           /* current program break */
     int  pid;
     int  state;
     int  user;
@@ -148,7 +150,7 @@ static void init_user_frame(int slot, u32 eip)
     sp[14] = eip;                           /* eip */
     sp[15] = USER_CS;
     sp[16] = 0x202;                         /* eflags: IF */
-    sp[17] = USER_STACK_VA + PAGE_SIZE;     /* user esp */
+    sp[17] = USER_STACK_TOP;                /* user esp */
     sp[18] = USER_DS;
 
     tasks[slot].esp = (u32)sp;
@@ -187,7 +189,7 @@ int sched_spawn(const char *name, const u8 *code, u32 size)
     }
     if (slot < 0)
         return -1;
-    if (!size || size > USER_PT_INDEX * PAGE_SIZE)
+    if (!size || size > USER_CODE_MAX)
         return -2;
 
     u32 cr3 = paging_new_user_space(code, size);
@@ -198,6 +200,9 @@ int sched_spawn(const char *name, const u8 *code, u32 size)
     tasks[slot].state = TASK_RUNNABLE;
     tasks[slot].user = 1;
     tasks[slot].cr3 = cr3;
+    tasks[slot].brk_base = USER_CODE_VA +
+                           ((size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
+    tasks[slot].brk = tasks[slot].brk_base;
     tasks[slot].kstack_top = (u32)(kstacks[slot] + KSTACK_SIZE);
     strncpy(tasks[slot].name, name, sizeof(tasks[slot].name) - 1);
     tasks[slot].name[sizeof(tasks[slot].name) - 1] = 0;
@@ -233,6 +238,48 @@ int sched_current_pid(void)
 const char *sched_current_name(void)
 {
     return tasks[current].name;
+}
+
+int sched_alive(int pid)
+{
+    return pid > 0 && pid < TASK_MAX && tasks[pid].state == TASK_RUNNABLE;
+}
+
+/* Foreground wait used by the shell: sleep until the process exits. */
+void sched_wait(int pid)
+{
+    while (sched_alive(pid))
+        __asm__ volatile("sti; hlt");
+}
+
+/* SYS_BRK: query (addr == 0) or move the current process' program break.
+ * Returns the new break, or the unchanged break on failure. */
+u32 sched_brk(u32 addr)
+{
+    struct task *t = &tasks[current];
+
+    if (!t->user)
+        return 0;
+    if (addr == 0)
+        return t->brk;
+    if (addr < t->brk_base || addr > USER_STACK_VA)
+        return t->brk;
+
+    u32 old_pg = (t->brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    u32 new_pg = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    if (new_pg > old_pg) {
+        u32 need = (new_pg - old_pg) / PAGE_SIZE;
+        /* keep 256 KB of frames for the kernel and other processes */
+        if (paging_frame_used() + need + 64 > paging_frame_total())
+            return t->brk;
+        paging_user_map(t->cr3, old_pg, need);
+    } else if (new_pg < old_pg) {
+        paging_user_unmap(t->cr3, new_pg, (old_pg - new_pg) / PAGE_SIZE);
+    }
+
+    t->brk = addr;
+    return addr;
 }
 
 void sched_ps(void)

@@ -11,7 +11,19 @@ By **XR Stu** — <https://xrst.uk>
 - **32-bit protected-mode C kernel** (freestanding, no libc) with a small NASM entry stub
 - **Paging and virtual memory**: 4 KB physical frame allocator, per-process page
   directories, kernel identity map, user mappings at `0x40000000`
-- **Ring-3 user mode** with `int 0x80` system calls (`write`, `exit`, `getpid`, `yield`)
+- **Ring-3 user mode** with `int 0x80` system calls (`write`, `exit`, `getpid`,
+  `yield`, `getchar`, `clear`, `putat`, `setcursor`, `readfile`, `writefile`,
+  `args`, `brk`)
+- **User-space heap**: per-process `sbrk`/`malloc`/`free`, multi-megabyte
+  allocations backed by on-demand page mapping (`user/rt.h`)
+- **Simplified JVM**: `jvm <file.cls>` runs a Java 8 class file — constant
+  pool / field / method parsing, ~60 bytecodes (const, load/store, iaload,
+  iadd, if_icmp*, invoke{static,virtual,special}, new, newarray, getstatic),
+  native stubs for `System.out.println`, and a conservative mark-sweep GC
+- **DocEditor (`doce`)**: a full-screen ring-3 text editor with arrow keys,
+  line editing, load/save and an unsaved-changes guard
+- **Droppable commands**: a bare command name runs `<NAME>.BIN` from the current
+  directory, so `pck` packages can add programs (`pck install doce` → `doce A.TXT`)
 - **Preemptive round-robin scheduler** driven by the PIT, with independent kernel
   stacks, TSS-based ring transitions and per-process address spaces
 - FAT16 filesystem with read/write and subdirectories (changes persist)
@@ -23,9 +35,11 @@ By **XR Stu** — <https://xrst.uk>
 - **System update**: `update` downloads the newest release image and flashes it
   onto the disk in place, then asks you to reboot
 - xsh shell: `help`, `dir`, `doc`, `mkdir`, `touch`, `goto`, `echo`, `time`, `date`,
-  `mem`, `net`, `ping`, `pck`, `alias`, `run`, `ps`, `kill`, `vm` and more
+  `mem`, `net`, `ping`, `pck`, `alias`, `run`, `jvm`, `doce`, `ps`, `kill`, `vm` and more
 - **Shell operators**: output redirection `>` / `>>`, input redirection `<`,
   and pipes `|` (up to 4 stages); built-in filters `grep`, `head`, `wc`
+- **Paged output**: `help` and `doc` pause every 20 lines (any key: next,
+  `q` / ESC: quit); pipes and redirection are never paged
 - **Multi-user accounts**: `cru <user>` to create, `cu <user>` to switch,
   `passwd <user>` to set a password (stored hashed in `/USER.DAT`)
 - Command aliases: `cls`, `ls`, `cat`, `type`, `cd`, `pwd`, `whoami`
@@ -49,6 +63,11 @@ brew install nasm mtools qemu lld llvm
 ./run.sh      # boots the image in QEMU (user-mode networking, NE2000 NIC)
 ```
 
+`run.sh` keeps your guest files on a persistent data disk: on first run it
+copies `build/ros.img` to `build/disk.img` and boots from that, so rebuilding
+the kernel never wipes data created inside the guest. Use `FRESH=1 ./run.sh`
+to rebase the data disk from a freshly built image.
+
 The kernel is compiled freestanding with
 `clang -target i386-elf -m32 -ffreestanding ...`, linked at physical `0x10000`
 by `ld.lld`, and flattened with `llvm-objcopy`.
@@ -66,6 +85,7 @@ by `ld.lld`, and flattened with `llvm-objcopy`.
 | `k32/rtc.c`, `pck.c`, `net.c` | clock, packages, NE2000 + ARP/ICMP |
 | `k32/paging.c`, `sched.c`, `syscall.c` | paging/VM, scheduler + TSS, `int 0x80` |
 | `user/user.asm` | demo ring-3 program loaded as `/USER.BIN` |
+| `user/doce.c`, `user/user.ld` | DocEditor source and its `0x40000000` linker script |
 | `legacy/kernel16.asm` | previous 16-bit assembly kernel (reference) |
 
 ## Shell operators
@@ -103,6 +123,31 @@ plain HTTP. GitHub itself only speaks HTTPS and the kernel has no TLS stack,
 which is why this small bridge exists. Start QEMU with `PCKHUB=0 ./run.sh` to
 skip the hub, or put a `.PCK` in the `/PCK` directory yourself.
 
+Installed files land in the current directory, and a bare command name runs
+`<NAME>.BIN` from there. That is how packages add commands:
+
+```sh
+pck install doce     # installs DOCE.BIN
+doce NOTES.TXT       # open (or create) NOTES.TXT in DocEditor
+```
+
+## DocEditor
+
+`doce` is a full-screen text editor written in C and built as a ring-3
+program (`user/doce.c`). It talks to the kernel only through `int 0x80`, so
+it lives in a `DOCE.BIN` that `pck install` can drop on any v0.13.2+ system.
+
+| Key | Action |
+| --- | --- |
+| Arrows, Home, End, PgUp, PgDn | move the cursor |
+| Enter / Backspace / Delete | edit the document |
+| Tab | insert spaces to the next 4-column stop |
+| Ctrl+S | save |
+| Ctrl+Q | quit (press twice if there are unsaved changes) |
+
+Files use 8.3 names and can hold up to 100 lines × 78 columns (about 8 KB).
+`doce` without a file name starts with `UNTITLED.TXT`.
+
 ## System update
 
 ```sh
@@ -116,10 +161,18 @@ newer, downloads the raw 32 MB image and writes it straight onto the disk
 the first write, the final size must match, and `reboot` is required
 afterwards.
 
+If GitHub is temporarily unreachable, the hub falls back to the last image it
+cached in `build/pckcache`.
+
+> **Updating from 0.13.3 or older:** those builds have a broken `update`
+> command (their 32 KB download buffer overlapped the kernel stack and crashed
+> with `#UD` at `CS:EIP = 0x8:0x3`). Flash the Alpha v0.13.4 image manually
+> once; `update` works from 0.13.4 onwards.
+
 For a local test without publishing a release, point the hub at an image:
 
 ```sh
-ROS_IMAGE=build/ros.img ROS_VERSION=0.13.1-test ./run.sh
+ROS_IMAGE=build/ros.img ROS_VERSION=0.13.4-test ./run.sh
 ```
 
 ## Versioning

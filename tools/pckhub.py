@@ -38,6 +38,9 @@ DL = "https://github.com/%s/%s/releases/download/%s/" % (OWNER, REPO, TAG)
 OS_IMAGE = os.environ.get("ROS_IMAGE")
 OS_VERSION = os.environ.get("ROS_VERSION")
 
+# last successfully fetched image, used when GitHub is temporarily unreachable
+OS_META = os.path.join(CACHE, "os-meta.txt")
+
 _os_cache = {"time": 0.0, "value": None}
 _os_lock = threading.Lock()
 
@@ -100,6 +103,61 @@ def fetch_os_asset(url, dest, compressed):
         os.replace(part, dest)
 
 
+def write_os_meta(ver, fn, asset_size=0):
+    os.makedirs(CACHE, exist_ok=True)
+    tmp = OS_META + ".part"
+    with open(tmp, "w") as out:
+        out.write("VERSION %s\nSIZE %d\nPATH %s\nASSET_SIZE %d\n"
+                  % (ver, os.path.getsize(fn), os.path.basename(fn), asset_size))
+    os.replace(tmp, OS_META)
+
+
+def meta_asset_size(fn):
+    """Compressed asset size recorded for fn, or -1 if unknown."""
+    try:
+        fields = {}
+        with open(OS_META) as f:
+            for line in f:
+                key, _, val = line.partition(" ")
+                fields[key] = val.strip()
+        if fields.get("PATH") == os.path.basename(fn):
+            return int(fields.get("ASSET_SIZE", "-1"))
+    except Exception:
+        pass
+    return -1
+
+
+def cached_os():
+    """(version, image path) from the last successful fetch, or None."""
+    try:
+        fields = {}
+        with open(OS_META) as f:
+            for line in f:
+                key, _, val = line.partition(" ")
+                fields[key] = val.strip()
+        fn = os.path.join(CACHE, fields["PATH"])
+        if os.path.isfile(fn) and os.path.getsize(fn) == int(fields["SIZE"]):
+            return (fields["VERSION"], fn)
+    except Exception:
+        pass
+
+    # no metadata file yet: use the newest cached image
+    best = None
+    try:
+        for name in os.listdir(CACHE):
+            if not (name.startswith("os-") and name.endswith(".img")):
+                continue
+            fn = os.path.join(CACHE, name)
+            if os.path.isfile(fn) and (best is None or
+                                       os.path.getmtime(fn) > os.path.getmtime(best)):
+                best = fn
+    except Exception:
+        return None
+    if best:
+        return (os.path.basename(best)[3:-4], best)
+    return None
+
+
 def latest_os():
     with _os_lock:
         return _latest_os()
@@ -116,28 +174,41 @@ def _latest_os():
     if _os_cache["value"] and now - _os_cache["time"] < 60:
         return _os_cache["value"]
 
-    req = urllib.request.Request(RELEASES, headers={"User-Agent": "ros-pckhub"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        releases = json.load(resp)
+    try:
+        req = urllib.request.Request(RELEASES, headers={"User-Agent": "ros-pckhub"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            releases = json.load(resp)
 
-    for rel in releases:
-        for a in rel.get("assets", []):
-            name = a.get("name", "")
-            if not (name.endswith(".img.gz") or name.endswith(".img")):
-                continue
-            tag = rel.get("tag_name", "unknown").lstrip("v")
-            dest = os.path.join(CACHE, "os-" + safe_name(tag) + ".img")
-            if not os.path.isfile(dest):
-                print("os: fetching %s" % name)
-                fetch_os_asset(a["browser_download_url"], dest,
-                               name.endswith(".gz"))
-                print("os: cached %s (%d bytes)" % (dest, os.path.getsize(dest)))
-            value = (tag, dest)
-            _os_cache["time"] = now
-            _os_cache["value"] = value
-            return value
+        for rel in releases:
+            for a in rel.get("assets", []):
+                name = a.get("name", "")
+                if not (name.endswith(".img.gz") or name.endswith(".img")):
+                    continue
+                tag = rel.get("tag_name", "unknown").lstrip("v")
+                dest = os.path.join(CACHE, "os-" + safe_name(tag) + ".img")
+                asset_size = int(a.get("size", 0))
+                if (not os.path.isfile(dest) or
+                        meta_asset_size(dest) != asset_size):
+                    print("os: fetching %s" % name)
+                    fetch_os_asset(a["browser_download_url"], dest,
+                                   name.endswith(".gz"))
+                    print("os: cached %s (%d bytes)" % (dest, os.path.getsize(dest)))
+                value = (tag, dest)
+                write_os_meta(*value, asset_size)
+                _os_cache["time"] = now
+                _os_cache["value"] = value
+                return value
 
-    raise RuntimeError("no .img/.img.gz asset found in releases")
+        raise RuntimeError("no .img/.img.gz asset found in releases")
+    except Exception as exc:                 # offline: reuse the last image
+        value = cached_os()
+        if not value:
+            raise
+        print("os: GitHub unavailable (%s), using cached %s"
+              % (exc, value[1]), file=sys.stderr)
+        _os_cache["time"] = now
+        _os_cache["value"] = value
+        return value
 
 
 class Handler(BaseHTTPRequestHandler):

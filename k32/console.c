@@ -79,6 +79,29 @@ void con_set_color(u8 color)
     attr = color;
 }
 
+/* Write one cell without moving the console cursor (used by DocEditor). */
+void con_putat(int r, int c, char ch, u8 color)
+{
+    if (r < 0 || r >= VGA_H || c < 0 || c >= VGA_W)
+        return;
+    VGA_MEM[r * VGA_W + c] = (u16)((u8)ch | ((u16)color << 8));
+}
+
+void con_setpos(int r, int c)
+{
+    if (r < 0)
+        r = 0;
+    if (r >= VGA_H)
+        r = VGA_H - 1;
+    if (c < 0)
+        c = 0;
+    if (c >= VGA_W)
+        c = VGA_W - 1;
+    row = r;
+    col = c;
+    cursor_update();
+}
+
 void con_putc(char c)
 {
     if (cap_on) {

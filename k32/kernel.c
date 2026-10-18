@@ -13,9 +13,10 @@
 #include "net.h"
 #include "paging.h"
 #include "sched.h"
+#include "syscall.h"
 #include "update.h"
 
-#define VERSION "0.13.0pre"
+#define VERSION "Alpha v0.14.0"
 #define LINE_MAX 128
 
 #define USER_MAX      16
@@ -295,6 +296,9 @@ static const char *const help_lines[] = {
     "  net     - show NE2000 network adapter",
     "  ping    - ICMP echo, e.g. ping 10.0.2.2",
     "  run     - run a user program, e.g. run user.bin",
+    "  jvm     - run a .class file, e.g. jvm hello.cls",
+    "  doce    - DocEditor, e.g. doce NOTES.TXT (pck install doce)",
+    "  <name>  - runs <NAME>.BIN from the current directory",
     "  ps      - list processes",
     "  kill    - kill a process, e.g. kill 2",
     "  vm      - show paging / virtual memory info",
@@ -403,7 +407,12 @@ static void cmd_doc(const char *name)
         con_puts("Is a directory.\n");
         return;
     }
-    int ended_nl = fs_print_file(&de);
+    int ended_nl = con_capture_active() ? fs_print_file(&de)
+                                        : fs_print_file_paged(&de, 20);
+    if (ended_nl < 0) {             /* 'q' at -- more -- */
+        con_putc('\n');
+        return;
+    }
     if (de.size && !ended_nl)
         con_putc('\n');
 }
@@ -896,12 +905,24 @@ static u8 prog_buf[32 * 1024];
 static void cmd_run(const char *arg)
 {
     struct fat_dirent de;
+    char file[16];
+    const char *extra = NULL;
+    int i = 0, j = 0;
 
     if (!arg) {
         con_puts("Usage: run <file>\n");
         return;
     }
-    if (!fs_ok || fs_find(arg, &de) < 0) {
+
+    while (arg[i] && arg[i] != ' ' && j < 15)
+        file[j++] = arg[i++];
+    file[j] = 0;
+    while (arg[i] == ' ')
+        i++;
+    if (arg[i])
+        extra = arg + i;
+
+    if (!fs_ok || fs_find(file, &de) < 0) {
         con_puts("File not found.\n");
         return;
     }
@@ -920,7 +941,8 @@ static void cmd_run(const char *arg)
         return;
     }
 
-    int pid = sched_spawn(arg, prog_buf, (u32)n);
+    syscall_set_args(extra ? extra : "");
+    int pid = sched_spawn(file, prog_buf, (u32)n);
     if (pid < 0) {
         if (pid == -1)
             con_puts("Process table is full.\n");
@@ -930,7 +952,64 @@ static void cmd_run(const char *arg)
             con_puts("Out of memory.\n");
         return;
     }
-    con_printf("Started '%s' as pid %d.\n", arg, pid);
+    con_printf("Started '%s' as pid %d.\n", file, pid);
+}
+
+/* A bare command name runs <NAME>.BIN from the current directory (foreground),
+ * so packages can add commands: e.g. "doce NOTES.TXT". */
+static int run_external(const char *cmd, const char *args)
+{
+    char fname[16];
+    struct fat_dirent de;
+    int i = 0, j = 0;
+
+    if (!fs_ok || !cmd[0] || strchr(cmd, '.'))
+        return 0;
+
+    while (cmd[i] && i < 8) {
+        char c = cmd[i++];
+        if (c >= 'a' && c <= 'z')
+            c = (char)(c - 32);
+        fname[j++] = c;
+    }
+    if (cmd[i])
+        return 0;
+    fname[j++] = '.';
+    fname[j++] = 'B';
+    fname[j++] = 'I';
+    fname[j++] = 'N';
+    fname[j] = 0;
+
+    if (fs_find(fname, &de) < 0 || (de.attr & 0x10))
+        return 0;
+    if (con_capture_active()) {
+        con_puts("Cannot run an interactive program with redirection.\n");
+        return 1;
+    }
+    if (de.size > sizeof(prog_buf)) {
+        con_puts("Program too large.\n");
+        return 1;
+    }
+
+    int n = fs_read_file(&de, prog_buf, sizeof(prog_buf));
+    if (n != (int)de.size) {
+        con_puts("Cannot read program.\n");
+        return 1;
+    }
+
+    syscall_set_args(args ? args : "");
+    int pid = sched_spawn(fname, prog_buf, (u32)n);
+    if (pid < 0) {
+        if (pid == -1)
+            con_puts("Process table is full.\n");
+        else if (pid == -2)
+            con_puts("Invalid program.\n");
+        else
+            con_puts("Out of memory.\n");
+        return 1;
+    }
+    sched_wait(pid);
+    return 1;
 }
 
 static void cmd_kill(const char *arg)
@@ -1161,6 +1240,8 @@ static void exec_cmd(char *line)
                !strcmp(line, "whoami")) {
         con_puts("Unknown command. Type 'help'. This command is not a standard "
                  "ROS command. Use 'alias -a true' to enable system alias.\n");
+    } else if (run_external(line, arg)) {
+        /* ran <NAME>.BIN from the current directory */
     } else {
         con_puts("Unknown command. Type 'help'.\n");
     }
@@ -1264,6 +1345,11 @@ static void run_line(char *line)
     char *seg[4];
     int nseg = 0;
 
+    while (*line == ' ')
+        line++;
+    if (!*line)
+        return;
+
     seg[nseg++] = line;
     for (char *p = line; *p; p++) {
         if (*p != '|')
@@ -1366,7 +1452,7 @@ void kmain(void)
     __asm__ volatile("sti");
 
     con_puts("============================================\n");
-    con_printf(" ROS Command v%s\n", VERSION);
+    con_printf(" ROS Command %s\n", VERSION);
     con_puts(" Lightweight 32-bit kernel by XR Stu - xrst.uk\n");
     con_puts(" Shell: xsh (X Shell)\n");
     con_puts("============================================\n");
@@ -1380,12 +1466,16 @@ void kmain(void)
     net_init();
 
     for (;;) {
-        con_puts("xsh:ROS");
-        con_puts(" ");
+        con_puts("xsh@");
         con_puts(users[cur_user].name);
         con_puts(" ");
         con_puts(fs_cwd());
-        con_puts("> ");
+        if (cur_user == 0)
+            con_puts("# ");
+        else if (users[cur_user].admin)
+            con_puts("$ ");
+        else
+            con_puts("> ");
         read_line(cmdline, LINE_MAX);
         run_line(cmdline);
     }

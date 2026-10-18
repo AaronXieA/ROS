@@ -178,13 +178,13 @@ u32 paging_user_phys(u32 va)
     return (pte & 0xFFFFF000u) | (va & 0xFFF);
 }
 
-/* Build a private address space: kernel identity map + code + stack */
+/* Build a private address space: kernel identity map + code + stack.
+ * The heap is empty at spawn; the process grows it with SYS_BRK. */
 u32 paging_new_user_space(const u8 *code, u32 size)
 {
-    u32 max_pages = USER_PT_INDEX;
     u32 pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
 
-    if (!size || pages > max_pages)
+    if (!size || pages > USER_CODE_MAX / PAGE_SIZE)
         return 0;
 
     u32 pd_phys = frame_alloc();
@@ -211,10 +211,47 @@ u32 paging_new_user_space(const u8 *code, u32 size)
         pt[i] = f | 0x7;
     }
 
-    u32 stack = frame_alloc();
-    if (!stack)
-        return 0;
-    pt[USER_PT_INDEX] = stack | 0x7;
+    for (u32 i = 0; i < USER_STACK_PAGES; i++) {
+        u32 f = frame_alloc();
+        if (!f)
+            return 0;
+        pt[((USER_STACK_VA >> 12) & 0x3FF) + i] = f | 0x7;
+    }
 
     return pd_phys;
+}
+
+/* Map `pages` fresh zeroed frames at the page-aligned user VA `va`.
+ * The caller checks frame availability first, so this cannot fail.
+ * Only valid for the currently active address space (invlpg). */
+void paging_user_map(u32 cr3, u32 va, u32 pages)
+{
+    u32 *pd = (u32 *)cr3;
+    u32 *pt = (u32 *)(pd[USER_PD_INDEX] & 0xFFFFF000u);
+
+    for (u32 i = 0; i < pages; i++) {
+        u32 f = frame_alloc();
+        if (!f)
+            break;
+        pt[((va >> 12) & 0x3FF) + i] = f | 0x7;
+        __asm__ volatile("invlpg (%0)" : : "r"(va + i * PAGE_SIZE) : "memory");
+    }
+}
+
+/* Unmap `pages` pages at the page-aligned user VA `va` and free the frames */
+void paging_user_unmap(u32 cr3, u32 va, u32 pages)
+{
+    u32 *pd = (u32 *)cr3;
+    u32 *pt = (u32 *)(pd[USER_PD_INDEX] & 0xFFFFF000u);
+
+    for (u32 i = 0; i < pages; i++) {
+        u32 idx = ((va >> 12) & 0x3FF) + i;
+        if (!(pt[idx] & 1))
+            continue;
+        u32 f = (pt[idx] & 0xFFFFF000u) / PAGE_SIZE;
+        if (f >= FIRST_FRAME && f < frame_count)
+            frame_set(f, 0);
+        pt[idx] = 0;
+        __asm__ volatile("invlpg (%0)" : : "r"(va + i * PAGE_SIZE) : "memory");
+    }
 }

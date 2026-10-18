@@ -42,6 +42,33 @@ if [ "$KSZ" -gt $((512 * 1024)) ]; then
     exit 1
 fi
 
+# ring-3 DocEditor: flat binary linked at 0x40000000 (not part of the kernel)
+$CC $CFLAGS -c user/doce.c -o build/doce.o
+$LLD -m elf_i386 -T user/user.ld -o build/doce.elf build/doce.o build/obj/string.o
+$OBJCOPY -O binary build/doce.elf build/doce.bin
+
+DSZ=$(stat -f%z build/doce.bin)
+if [ "$DSZ" -gt $((32 * 1024)) ]; then
+    echo "error: DOCE.BIN is $DSZ bytes, must stay below 32 KB" >&2
+    exit 1
+fi
+
+# ring-3 heap test program (flat binary at 0x40000000)
+$CC $CFLAGS -c user/memtest.c -o build/memtest.o
+$LLD -m elf_i386 -T user/user.ld -o build/memtest.elf build/memtest.o
+$OBJCOPY -O binary build/memtest.elf build/memtest.bin
+
+# ring-3 JVM (flat binary at 0x40000000)
+$CC $CFLAGS -c user/jvm.c -o build/jvm.o
+$LLD -m elf_i386 -T user/user.ld -o build/jvm.elf build/jvm.o
+$OBJCOPY -O binary build/jvm.elf build/jvm.bin
+
+JSZ=$(stat -f%z build/jvm.bin)
+if [ "$JSZ" -gt $((32 * 1024)) ]; then
+    echo "error: JVM.BIN is $JSZ bytes, must stay below 32 KB" >&2
+    exit 1
+fi
+
 for f in build/mbr.bin build/vbr.bin; do
     SZ=$(stat -f%z "$f")
     if [ "$SZ" -ne 512 ]; then
@@ -64,6 +91,8 @@ mformat -i build/ros.img@@${PARTOFF} -h 16 -s 63 -c 4 -r 32 -B build/vbr.bin ::
 # copy kernel and sample files into the partition
 mcopy -i build/ros.img@@${PARTOFF} -o build/kernel.bin ::KERNEL.BIN
 mcopy -i build/ros.img@@${PARTOFF} -o build/USER.BIN ::USER.BIN
+mcopy -i build/ros.img@@${PARTOFF} -o build/memtest.bin ::MEMTEST.BIN
+mcopy -i build/ros.img@@${PARTOFF} -o build/jvm.bin ::JVM.BIN
 
 for f in files/*; do
     if [ -d "$f" ]; then
@@ -91,4 +120,11 @@ if [ -d pkgsrc ]; then
     done
 fi
 
-echo "OK: build/ros.img (kernel $KSZ bytes)"
+# DocEditor package: pck install doce -> DOCE.BIN in the current directory
+mkdir -p build/pkg/doce
+cp build/doce.bin build/pkg/doce/DOCE.BIN
+sh tools/mkpck.sh build/DOCE.PCK build/pkg/doce/DOCE.BIN >/dev/null
+mmd -i build/ros.img@@${PARTOFF} "::PCK" 2>/dev/null || true
+mcopy -i build/ros.img@@${PARTOFF} -o build/DOCE.PCK "::PCK/DOCE.PCK"
+
+echo "OK: build/ros.img (kernel $KSZ bytes, doce $DSZ bytes)"

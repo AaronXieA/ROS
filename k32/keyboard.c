@@ -5,7 +5,7 @@
 
 static volatile u8 buf[KBD_BUF];
 static volatile u32 head, tail;
-static int shift, caps;
+static int shift, caps, ctrl, e0;
 
 static const char map_lo[128] = {
     0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b', '\t',
@@ -24,7 +24,7 @@ static const char map_hi[128] = {
 void keyboard_init(void)
 {
     head = tail = 0;
-    shift = caps = 0;
+    shift = caps = ctrl = e0 = 0;
     while (inb(0x64) & 1)
         (void)inb(0x60);
 }
@@ -42,6 +42,31 @@ void keyboard_irq(void)
 {
     u8 sc = inb(0x60);
 
+    /* 0xE0-prefixed keys: arrows, home/end, pgup/pgdn, delete.
+     * They are queued as 0x80 | scancode so the shell can ignore them. */
+    if (sc == 0xE0) {
+        e0 = 1;
+        return;
+    }
+    if (sc == 0xE1) {
+        e0 = 0;
+        return;
+    }
+    if (e0) {
+        e0 = 0;
+        if (!(sc & 0x80))
+            push((u8)(0x80 | sc));
+        return;
+    }
+
+    if (sc == 0x1D) {
+        ctrl = 1;
+        return;
+    }
+    if (sc == 0x9D) {
+        ctrl = 0;
+        return;
+    }
     if (sc == 0x2A || sc == 0x36) {
         shift = 1;
         return;
@@ -56,6 +81,15 @@ void keyboard_irq(void)
     }
     if (sc & 0x80)
         return;
+
+    /* Ctrl+letter -> standard control code (Ctrl+S = 0x13, Ctrl+Q = 0x11) */
+    if (ctrl) {
+        char lc = map_lo[sc];
+        if (lc >= 'a' && lc <= 'z') {
+            push((u8)(lc - 'a' + 1));
+            return;
+        }
+    }
 
     char c = shift ? map_hi[sc] : map_lo[sc];
     if (c >= 'a' && c <= 'z' && caps)
