@@ -5,6 +5,19 @@ booted by a custom MBR + FAT16 VBR, with a built-in shell called **xsh**.
 
 By **XR Stu** — <https://xrst.uk>
 
+> **A note on history:** the first releases (v0.5–v0.9) were a pure-assembly 16-bit
+> real-mode kernel. Since v0.10.0 the kernel has been rewritten in 32-bit C and the
+> system has grown paging, ring-3 user mode, preemptive scheduling, multi-user
+> accounts, TCP/IP and a package manager. The old kernel is kept for reference in
+> `legacy/kernel16.asm`.
+
+## Contents
+
+[Features](#features) · [How it boots](#how-it-boots) · [Requirements](#requirements) ·
+[Build & Run](#build--run) · [Source layout](#source-layout) ·
+[Shell operators](#shell-operators) · [Packages](#packages) · [DocEditor](#doceditor) ·
+[System update](#system-update) · [Versioning](#versioning) · [License](#license)
+
 ## Features
 
 - Custom **MBR + FAT16 VBR** boot chain (no bootloader library)
@@ -34,8 +47,9 @@ By **XR Stu** — <https://xrst.uk>
   GitHub Releases through a small host-side hub (`tools/pckhub.py`)
 - **System update**: `update` downloads the newest release image and flashes it
   onto the disk in place, then asks you to reboot
-- xsh shell: `help`, `dir`, `doc`, `mkdir`, `touch`, `goto`, `echo`, `time`, `date`,
-  `mem`, `net`, `ping`, `pck`, `alias`, `run`, `jvm`, `doce`, `ps`, `kill`, `vm` and more
+- xsh shell: `help`, `ver`, `about`, `dir`, `doc`, `mkdir`, `touch`, `goto`, `echo`,
+  `time`, `date`, `mem`, `net`, `ping`, `pck`, `alias`, `run`, `jvm`, `doce`, `ps`,
+  `kill`, `vm`, `update`, `reboot`, `halt` and more
 - **Shell operators**: output redirection `>` / `>>`, input redirection `<`,
   and pipes `|` (up to 4 stages); built-in filters `grep`, `head`, `wc`
 - **Paged output**: `help` and `doc` pause every 20 lines (any key: next,
@@ -45,6 +59,21 @@ By **XR Stu** — <https://xrst.uk>
 - Command aliases: `cls`, `ls`, `cat`, `type`, `cd`, `pwd`, `whoami`
 - **pck** package manager: `pck list` / `pck install <name>` / `pck remove <name>`
 - Runs in QEMU as a raw 32 MB hard disk image
+
+## How it boots
+
+No bootloader library is used — every stage is hand-written:
+
+```
+BIOS
+ └─ MBR (sector 0)   mbr.asm       locates the FAT16 partition, loads its VBR
+     └─ VBR (LBA 2048)  vbr.asm    finds KERNEL.BIN in the root directory and
+                                   loads it to 0x1000:0000
+         └─ k32/boot.asm           16-bit entry: A20, E820 memory map, GDT,
+                                   then jumps to 32-bit protected mode
+             └─ k32/kernel.c       C kernel linked at physical 0x10000: sets up
+                                   the IDT/PIC, paging, scheduler, then starts xsh
+```
 
 ## Requirements
 
