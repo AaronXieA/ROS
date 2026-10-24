@@ -6,6 +6,7 @@
 #include "keyboard.h"
 #include "fat.h"
 #include "string.h"
+#include "rtc.h"
 
 #define SYS_WRITE      1
 #define SYS_EXIT       2
@@ -19,6 +20,8 @@
 #define SYS_WRITEFILE 10
 #define SYS_ARGS      11
 #define SYS_BRK       12
+#define SYS_SLEEP     13
+#define SYS_TIME      14
 
 #define FILE_BUF_MAX (32 * 1024)
 
@@ -173,6 +176,21 @@ static int sys_args(u32 buf_va, u32 max)
     return (int)n;
 }
 
+static int sys_time(u32 va)
+{
+    u8 h, m, s, day, mon, year, cent;
+    struct ros_time t;
+
+    rtc_read(&h, &m, &s, &day, &mon, &year, &cent);
+    t.sec = s;
+    t.min = m;
+    t.hour = h;
+    t.day = day;
+    t.mon = mon;
+    t.year = (u16)(cent * 100 + year);
+    return copy_to_user(va, (const u8 *)&t, sizeof(t)) < 0 ? -1 : 0;
+}
+
 u32 syscall_handler(regs_t *r)
 {
     switch (r->eax) {
@@ -214,6 +232,11 @@ u32 syscall_handler(regs_t *r)
         return (u32)r;
     case SYS_BRK:                   /* ebx = new break (0 = query) */
         r->eax = sched_brk(r->ebx);
+        return (u32)r;
+    case SYS_SLEEP:                 /* ebx = milliseconds */
+        return sched_sleep(r);
+    case SYS_TIME:                  /* ebx = struct ros_time * */
+        r->eax = (u32)sys_time(r->ebx);
         return (u32)r;
     default:
         r->eax = 0xFFFFFFFFu;

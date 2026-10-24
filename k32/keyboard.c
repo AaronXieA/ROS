@@ -1,5 +1,6 @@
 #include "keyboard.h"
 #include "io.h"
+#include "sched.h"
 
 #define KBD_BUF 256
 
@@ -86,7 +87,10 @@ void keyboard_irq(void)
     if (ctrl) {
         char lc = map_lo[sc];
         if (lc >= 'a' && lc <= 'z') {
-            push((u8)(lc - 'a' + 1));
+            u8 cc = (u8)(lc - 'a' + 1);
+            if (cc == 3 && sched_on_ctlc())
+                return;             /* Ctrl+C kills the foreground process */
+            push(cc);
             return;
         }
     }

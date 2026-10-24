@@ -23,6 +23,8 @@ typedef unsigned int  size_t;
 #define SYS_WRITEFILE 10
 #define SYS_ARGS      11
 #define SYS_BRK       12
+#define SYS_SLEEP     13
+#define SYS_TIME      14
 
 static int sys_call(int n, int a, int b, int c)
 {
@@ -68,7 +70,7 @@ static void __attribute__((unused)) print_dec(u32 v)
     }
 }
 
-static void print_hex(u32 v)
+static void __attribute__((unused)) print_hex(u32 v)
 {
     char b[9];
     int n = 0;
@@ -86,6 +88,24 @@ static void print_hex(u32 v)
 
         sys_call(SYS_WRITE, (int)&c, 1, 0);
     }
+}
+
+/* ---- time: RTC clock and millisecond sleep ---- */
+struct ros_time {
+    u8  sec, min, hour;
+    u8  day, mon;               /* mon: 1-12 */
+    unsigned short year;        /* e.g. 2026 */
+} __attribute__((packed));
+
+static void __attribute__((unused)) sleep_ms(u32 ms)
+{
+    sys_call(SYS_SLEEP, (int)ms, 0, 0);
+}
+
+/* fill *t with the current RTC time; returns 0 on success */
+static int __attribute__((unused)) get_time(struct ros_time *t)
+{
+    return sys_call(SYS_TIME, (int)t, 0, 0);
 }
 
 /* ---- heap: brk + first-fit malloc with splitting and coalescing ---- */
@@ -111,7 +131,7 @@ struct mblk {
 
 static struct mblk *heap_head = 0;
 
-static void *malloc(u32 n)
+static void *__attribute__((unused)) malloc(u32 n)
 {
     struct mblk *b, *prev;
 
@@ -161,7 +181,7 @@ use:
     return (void *)((u32)b + MBLK_HDR);
 }
 
-static void free(void *p)
+static void __attribute__((unused)) free(void *p)
 {
     if (p)
         ((struct mblk *)((u32)p - MBLK_HDR))->free = 1;

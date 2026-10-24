@@ -16,7 +16,7 @@
 #include "syscall.h"
 #include "update.h"
 
-#define VERSION "Alpha v0.14.0"
+#define VERSION "Alpha v0.14.1"
 #define LINE_MAX 128
 
 #define USER_MAX      16
@@ -62,6 +62,11 @@ static void read_line(char *buf, int max)
         if (c == '\n') {
             con_putc('\n');
             buf[n] = 0;
+            return;
+        }
+        if (c == 3) {           /* Ctrl+C: abandon the line */
+            con_puts("^C\n");
+            buf[0] = 0;
             return;
         }
         if (c == '\b') {
@@ -274,6 +279,7 @@ static const char *const help_lines[] = {
     "  echo    - print text, e.g. echo hello",
     "  > >> <  - redirect output/input, e.g. echo hi > A.TXT",
     "  |       - pipe, e.g. dir | grep TXT",
+    "  Ctrl+C  - stop the running program / abandon input line",
     "  grep    - filter input lines, e.g. dir | grep TXT",
     "  head    - show first lines of input, e.g. head 5",
     "  wc      - count lines/words/bytes of input",
@@ -298,6 +304,7 @@ static const char *const help_lines[] = {
     "  run     - run a user program, e.g. run user.bin",
     "  jvm     - run a .class file, e.g. jvm hello.cls",
     "  doce    - DocEditor, e.g. doce NOTES.TXT (pck install doce)",
+    "  count   - countdown demo: sleep + time, Ctrl+C stops it",
     "  <name>  - runs <NAME>.BIN from the current directory",
     "  ps      - list processes",
     "  kill    - kill a process, e.g. kill 2",
@@ -1008,7 +1015,11 @@ static int run_external(const char *cmd, const char *args)
             con_puts("Out of memory.\n");
         return 1;
     }
+    sched_set_fg(pid);
     sched_wait(pid);
+    sched_set_fg(0);
+    if (sched_take_ctlc())
+        con_puts("^C\n");
     return 1;
 }
 

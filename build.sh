@@ -58,6 +58,11 @@ $CC $CFLAGS -c user/memtest.c -o build/memtest.o
 $LLD -m elf_i386 -T user/user.ld -o build/memtest.elf build/memtest.o
 $OBJCOPY -O binary build/memtest.elf build/memtest.bin
 
+# ring-3 countdown demo (flat binary at 0x40000000)
+$CC $CFLAGS -c user/count.c -o build/count.o
+$LLD -m elf_i386 -T user/user.ld -o build/count.elf build/count.o
+$OBJCOPY -O binary build/count.elf build/count.bin
+
 # ring-3 JVM (flat binary at 0x40000000)
 $CC $CFLAGS -c user/jvm.c -o build/jvm.o
 $LLD -m elf_i386 -T user/user.ld -o build/jvm.elf build/jvm.o
@@ -92,6 +97,7 @@ mformat -i build/ros.img@@${PARTOFF} -h 16 -s 63 -c 4 -r 32 -B build/vbr.bin ::
 mcopy -i build/ros.img@@${PARTOFF} -o build/kernel.bin ::KERNEL.BIN
 mcopy -i build/ros.img@@${PARTOFF} -o build/USER.BIN ::USER.BIN
 mcopy -i build/ros.img@@${PARTOFF} -o build/memtest.bin ::MEMTEST.BIN
+mcopy -i build/ros.img@@${PARTOFF} -o build/count.bin ::COUNT.BIN
 mcopy -i build/ros.img@@${PARTOFF} -o build/jvm.bin ::JVM.BIN
 
 for f in files/*; do

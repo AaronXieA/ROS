@@ -3,9 +3,11 @@
 #include "paging.h"
 #include "console.h"
 #include "string.h"
+#include "timer.h"
 
 #define TASK_FREE     0
 #define TASK_RUNNABLE 1
+#define TASK_SLEEPING 2
 
 #define KSTACK_SIZE   8192
 #define QUANTUM       5             /* timer ticks (50 ms at 100 Hz) */
@@ -24,6 +26,7 @@ struct task {
     u32  kstack_top;
     u32  brk_base;      /* first heap VA (right after the code pages) */
     u32  brk;           /* current program break */
+    u32  wake_tick;     /* timer_ticks() deadline while TASK_SLEEPING */
     int  pid;
     int  state;
     int  user;
@@ -34,6 +37,9 @@ static struct task tasks[TASK_MAX];
 static u8 kstacks[TASK_MAX][KSTACK_SIZE] __attribute__((aligned(16)));
 static int current;
 static u32 tick_count;
+static int fg_pid;              /* process the shell waits on; Ctrl+C kills it */
+static volatile int ctlc_pid;   /* deferred kill target set by the keyboard IRQ */
+static volatile int ctlc_hit;   /* a foreground process was killed by Ctrl+C */
 
 /* ---- GDT / TSS ---- */
 struct gdt_entry {
@@ -242,7 +248,74 @@ const char *sched_current_name(void)
 
 int sched_alive(int pid)
 {
-    return pid > 0 && pid < TASK_MAX && tasks[pid].state == TASK_RUNNABLE;
+    return pid > 0 && pid < TASK_MAX && tasks[pid].state != TASK_FREE;
+}
+
+/* ---- foreground process and Ctrl+C ---- */
+void sched_set_fg(int pid)
+{
+    fg_pid = (pid > 0 && pid < TASK_MAX) ? pid : 0;
+}
+
+/* Called from the keyboard IRQ when Ctrl+C is pressed. Returns 1 if a
+ * foreground user process was marked for termination (the key stroke is
+ * swallowed), 0 when the 0x03 should be queued for whoever reads stdin. */
+int sched_on_ctlc(void)
+{
+    int pid = fg_pid;
+
+    if (pid > 0 && pid < TASK_MAX && tasks[pid].user &&
+        tasks[pid].state != TASK_FREE) {
+        ctlc_pid = pid;
+        return 1;
+    }
+    return 0;
+}
+
+/* Returns and clears the "foreground process died by Ctrl+C" flag, so the
+ * shell can print a ^C hint when its sched_wait() returns. */
+int sched_take_ctlc(void)
+{
+    int hit = ctlc_hit;
+
+    ctlc_hit = 0;
+    return hit;
+}
+
+/* ---- sleeping ---- */
+static void wake_sleepers(void)
+{
+    u32 now = timer_ticks();
+
+    for (int i = 1; i < TASK_MAX; i++) {
+        if (tasks[i].state == TASK_SLEEPING &&
+            (s32)(now - tasks[i].wake_tick) >= 0)
+            tasks[i].state = TASK_RUNNABLE;
+    }
+}
+
+/* SYS_SLEEP: park the current user process for at least ms milliseconds. */
+u32 sched_sleep(regs_t *r)
+{
+    struct task *t = &tasks[current];
+
+    if (!t->user)
+        return (u32)r;
+
+    u32 want = (r->ebx + 9) / 10;           /* 100 Hz timer */
+    if (!want)
+        want = 1;
+    t->wake_tick = timer_ticks() + want;
+    t->state = TASK_SLEEPING;
+
+    int next = task_pick_next();
+    if (next == current) {                  /* nothing else runnable: fake it */
+        t->state = TASK_RUNNABLE;
+        return (u32)r;
+    }
+
+    task_activate(next);
+    return tasks[next].esp;
 }
 
 /* Foreground wait used by the shell: sleep until the process exits. */
@@ -288,16 +361,32 @@ void sched_ps(void)
     for (int i = 0; i < TASK_MAX; i++) {
         if (tasks[i].state == TASK_FREE)
             continue;
+        const char *st = i == current ? "running" :
+                         tasks[i].state == TASK_SLEEPING ? "sleeping" : "ready";
         con_printf("%d\t%s\t%s\t%s\t0x%x\n", i,
                    tasks[i].user ? "user" : "kernel",
-                   i == current ? "running" : "ready",
-                   tasks[i].name, tasks[i].cr3);
+                   st, tasks[i].name, tasks[i].cr3);
     }
 }
 
 /* ---- scheduling entry points ---- */
 u32 sched_on_tick(regs_t *r)
 {
+    wake_sleepers();
+
+    if (ctlc_pid) {                     /* Ctrl+C kill, deferred from the IRQ */
+        int pid = ctlc_pid;
+
+        ctlc_pid = 0;
+        if (pid > 0 && pid < TASK_MAX && tasks[pid].user &&
+            tasks[pid].state != TASK_FREE) {
+            ctlc_hit = 1;
+            if (pid == current)
+                return sched_exit_current(r);
+            sched_kill(pid);
+        }
+    }
+
     if (!any_user_task()) {
         tick_count = 0;
         return (u32)r;

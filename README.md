@@ -26,7 +26,12 @@ By **XR Stu** — <https://xrst.uk>
   directories, kernel identity map, user mappings at `0x40000000`
 - **Ring-3 user mode** with `int 0x80` system calls (`write`, `exit`, `getpid`,
   `yield`, `getchar`, `clear`, `putat`, `setcursor`, `readfile`, `writefile`,
-  `args`, `brk`)
+  `args`, `brk`, `sleep`, `time`)
+- **Ctrl+C kills the foreground program** (at the shell prompt it abandons the
+  current input line instead)
+- **User programs can sleep and read the clock**: `sleep` parks a process for
+  a number of milliseconds without burning CPU; `time` returns the RTC
+  date/time — see the built-in `count` countdown demo
 - **User-space heap**: per-process `sbrk`/`malloc`/`free`, multi-megabyte
   allocations backed by on-demand page mapping (`user/rt.h`)
 - **Simplified JVM**: `jvm <file.cls>` runs a Java 8 class file — constant
@@ -48,8 +53,8 @@ By **XR Stu** — <https://xrst.uk>
 - **System update**: `update` downloads the newest release image and flashes it
   onto the disk in place, then asks you to reboot
 - xsh shell: `help`, `ver`, `about`, `dir`, `doc`, `mkdir`, `touch`, `goto`, `echo`,
-  `time`, `date`, `mem`, `net`, `ping`, `pck`, `alias`, `run`, `jvm`, `doce`, `ps`,
-  `kill`, `vm`, `update`, `reboot`, `halt` and more
+  `time`, `date`, `mem`, `net`, `ping`, `pck`, `alias`, `run`, `jvm`, `doce`, `count`,
+  `ps`, `kill`, `vm`, `update`, `reboot`, `halt` and more
 - **Shell operators**: output redirection `>` / `>>`, input redirection `<`,
   and pipes `|` (up to 4 stages); built-in filters `grep`, `head`, `wc`
 - **Paged output**: `help` and `doc` pause every 20 lines (any key: next,
